@@ -1,0 +1,102 @@
+dataset:
+  dataset_name: InfiniteChoice                                  # or InfiniteQALoader, NovelQA.
+  dataset_path: ./data/InfiniteBench/longbook_choice_eng.jsonl  # path to your dataset path. 
+
+llm:
+  llm_name: Qwen2.5-7B-Instruct
+  llm_path: path/to/your/llm/model  # path to your llm model.
+  llm_device: cuda                  # device to run the llm.
+
+paths:
+  log_path: ./log             # path to save the log.
+  answer_path: ./answer/test  # path to save the answer.
+  cache_path: ./cache/test    # path to save the cache.
+
+extractor:
+  language: "en"  # language of the extractor.
+  method: "Spacy" # method of the extractor.
+
+cluster:
+  length: 1200  # length of each chunk.
+  overlap: 100  # overlap of each chunk.
+  merge_num: 5  # number of chunks to merge.
+  force_Reextract: False   # whether to force reextract the graph, ignoring the existed cache.
+
+resume:
+  resumeIndex: 0  # index of the resume.
+
+retriever:
+  kwargs:
+    # Core settings
+    device: cuda                      # device to run the retriever.
+    debug: True                       # whether to print the debug information.
+    merge_num: 5                      # number of chunks to merge.
+    overlap: 100                      # overlap of each chunk.
+    tokenizer: path/to/your/tokenizer # path to your tokenizer.
+    embedder: BAAI/bge-m3            # embedding model (set to null to disable dense retrieval)
+    
+    # Enhanced retrieval settings
+    use_enhanced_retrieval: True      # Enable enhanced parallel retrieval system
+    
+    # Budget allocation
+    budget_N: 10                      # Total chunks to return
+    cap_I_ratio: 0.5                  # Max ratio for hard overlap chunks (0.4-0.6 recommended)
+    max_chunk_setting: 10             # Legacy compatibility alias for budget_N
+    
+    # Parallel recall parameters
+    tree_top_k: 15                    # Top-K chunks from tree recall
+    graph_top_k: 15                   # Top-K chunks from graph recall  
+    bm25_top_k: 8                     # Top-K chunks from BM25 recall
+    dense_top_k: 8                    # Top-K chunks from dense recall
+    graph_max_hops: 2                 # Maximum hops for graph expansion (1-2)
+    shortest_path_k: 4                # Legacy parameter for graph traversal
+    
+    # RRF and scoring parameters
+    rrf_k: 60                         # RRF constant for ranking fusion
+    mmr_lambda: 0.75                  # MMR trade-off (0.7-0.8 recommended)
+    
+    # Diversity constraints
+    max_same_subtree_ratio: 0.5       # Max chunks from same subtree
+    max_same_entity_cluster_ratio: 0.5 # Max chunks from same entity cluster
+    min_query_entities_covered: 2     # Minimum query entities to cover
+    
+    # Temporal parameters
+    recency_half_life: 180            # Half-life for recency decay (days)
+    recency_min: 0.2                  # Minimum recency score
+    
+    # Advanced scoring weights (optional - will use defaults if not specified)
+    scoring_weights:
+      sim_emb: 0.35          # Embedding similarity
+      sim_lex: 0.20          # Lexical similarity 
+      ent_overlap: 0.20      # Entity overlap
+      path_score: 0.15       # Graph path scoring
+      level_boost: 0.05      # Tree level boost
+      recency: 0.05          # Recency boost
+      authority: 0.03        # Authority score
+      overlap_bonus: 0.02    # Multi-channel overlap bonus
+    
+    # Question type specific weights (optional)
+    question_type_weights:
+      definition:
+        sim_emb: 0.35
+        sim_lex: 0.25
+        level_boost: 0.20
+        ent_overlap: 0.10
+        recency: 0.05
+        path_score: 0.05
+      
+      relation:
+        ent_overlap: 0.25
+        path_score: 0.25
+        sim_emb: 0.20
+        sim_lex: 0.15
+        level_boost: 0.10
+        recency: 0.05
+      
+      recent:
+        recency: 0.30
+        sim_emb: 0.25
+        sim_lex: 0.20
+        ent_overlap: 0.10
+        level_boost: 0.10
+        path_score: 0.05
