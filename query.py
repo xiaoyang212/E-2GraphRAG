@@ -424,6 +424,196 @@ class Retriever:
         filtered_res = self.merge_keys(filtered_res)
         return filtered_res
 
+    def hybrid_retrieval(self, query, entities, **kwargs):
+        """
+        Implement the primary-auxiliary collaborative hybrid retrieval strategy.
+        
+        1. Primary retrieval with summary tree: semantic search for high-level and leaf nodes
+        2. Auxiliary retrieval with entity graph: find entities and their relationship networks  
+        3. Result fusion and deduplication: keep all high-level summaries, deduplicate overlaps
+        4. Supplementary completion: use entityaware_filter for remaining chunks
+        """
+        max_chunk_setting = kwargs.get("max_chunk_setting", 25)
+        
+        # Step 1: Primary retrieval - semantic search in summary tree
+        tree_results = self.tree_semantic_search(query, max_chunk_setting * 2, **kwargs)
+        
+        # Step 2: Auxiliary retrieval - entity graph search  
+        graph_results = self.local_retrieval(entities, kwargs.get("shortest_path_k", 4))
+        
+        # Step 3: Result fusion and deduplication
+        fused_results = self.fuse_and_deduplicate(tree_results, graph_results, **kwargs)
+        
+        # Step 4: Supplementary completion with remaining slots
+        current_count = self._count_chunks(fused_results)
+        if current_count < max_chunk_setting:
+            remaining_slots = max_chunk_setting - current_count
+            fused_results = self.supplement_with_entityaware_filter(
+                fused_results, entities, remaining_slots, **kwargs
+            )
+        
+        return fused_results
+        
+    def tree_semantic_search(self, query, k, **kwargs):
+        """
+        Perform semantic search in the summary tree to find relevant high-level nodes and leaf nodes.
+        Returns a dict with high_level_summaries and leaf_nodes separated.
+        """
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Embedder or FAISS index not available, falling back to empty tree results")
+            return {"high_level_summaries": {}, "leaf_nodes": {}}
+            
+        # Encode query for similarity search
+        try:
+            query_embed = self.embedder.encode(query).reshape(1, -1)
+        except Exception as e:
+            logger.error(f"Failed to encode query: {e}")
+            return {"high_level_summaries": {}, "leaf_nodes": {}}
+        
+        # Search in the collapsed tree (which contains all nodes)
+        try:
+            search_k = min(k, len(self.collapse_tree_ids))
+            if search_k == 0:
+                return {"high_level_summaries": {}, "leaf_nodes": {}}
+                
+            _, candidate_indices = self.faiss_index.search(query_embed, k=search_k)
+            candidate_indices = candidate_indices[0]
+        except Exception as e:
+            logger.error(f"FAISS search failed: {e}")
+            return {"high_level_summaries": {}, "leaf_nodes": {}}
+        
+        # Separate results by node type 
+        high_level_summaries = {}
+        leaf_nodes = {}
+        
+        for idx in candidate_indices:
+            if idx >= len(self.collapse_tree_ids):
+                continue  # Skip invalid indices
+                
+            chunk_id = self.collapse_tree_ids[idx]
+            
+            if chunk_id.startswith("leaf_"):
+                # This is a leaf node - add to leaf_nodes
+                leaf_nodes.setdefault("tree_leaf", []).append(chunk_id)
+            elif chunk_id.startswith("summary_"):
+                # This is a summary node - determine its level
+                try:
+                    level = int(chunk_id.split("_")[1])
+                    if level >= 1:  # Level 1 and above are considered "high-level"
+                        high_level_summaries.setdefault(f"high_level_{level}", []).append(chunk_id)
+                    else:
+                        # Level 0 summaries are closer to leaves
+                        leaf_nodes.setdefault("tree_summary", []).append(chunk_id)
+                except (IndexError, ValueError):
+                    # Invalid chunk_id format, skip
+                    logger.warning(f"Invalid chunk_id format: {chunk_id}")
+                    continue
+        
+        return {"high_level_summaries": high_level_summaries, "leaf_nodes": leaf_nodes}
+    
+    def fuse_and_deduplicate(self, tree_results, graph_results, **kwargs):
+        """
+        Fuse results from tree and graph retrieval, removing duplicates while preserving all high-level summaries.
+        """
+        fused_results = {}
+        
+        # Step 1: Keep ALL high-level summary nodes (these provide indispensable background)
+        high_level_summaries = tree_results.get("high_level_summaries", {})
+        if high_level_summaries:
+            fused_results.update(high_level_summaries)
+        
+        # Step 2: Collect all leaf-level chunks from both sources
+        all_leaf_chunks = set()
+        
+        # From tree search (leaf nodes)
+        tree_leaves = tree_results.get("leaf_nodes", {})
+        for key, chunks in tree_leaves.items():
+            if isinstance(chunks, list):
+                all_leaf_chunks.update(chunks)
+        
+        # From graph search  
+        for key, chunks in graph_results.items():
+            if isinstance(chunks, list):
+                all_leaf_chunks.update(chunks)
+        
+        # Step 3: Deduplicate leaf chunks - only keep one copy of each
+        if all_leaf_chunks:
+            fused_results["deduplicated_leaves"] = list(all_leaf_chunks)
+            
+        return fused_results
+    
+    def supplement_with_entityaware_filter(self, current_results, entities, remaining_slots, **kwargs):
+        """
+        Fill remaining slots using entityaware_filter strategy on candidates not yet selected.
+        """
+        if remaining_slots <= 0 or not entities:
+            return current_results
+            
+        # Get all currently selected chunks to avoid duplicates
+        selected_chunks = set()
+        for chunks in current_results.values():
+            if isinstance(chunks, list):
+                selected_chunks.update(chunks)
+        
+        # Only proceed if we have embedder and FAISS index
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Cannot supplement chunks: embedder or FAISS index not available")
+            return current_results
+        
+        # Get additional candidates through dense retrieval
+        query = kwargs.get("query", "")
+        if not query:
+            logger.warning("No query provided for supplementary retrieval")
+            return current_results
+            
+        try:
+            query_embed = self.embedder.encode(query).reshape(1, -1)
+            search_k = min(remaining_slots * 3, len(self.collapse_tree_ids))
+            _, candidate_indices = self.faiss_index.search(query_embed, k=search_k)
+            candidate_indices = candidate_indices[0]
+        except Exception as e:
+            logger.error(f"Failed to get supplementary candidates: {e}")
+            return current_results
+        
+        # Filter out already selected chunks and create candidate dict
+        candidate_chunks = {}
+        for idx in candidate_indices:
+            if idx >= len(self.collapse_tree_ids):
+                continue
+                
+            chunk_id = self.collapse_tree_ids[idx] 
+            if chunk_id not in selected_chunks:
+                # Find which entities this chunk contains
+                chunk_entities = []
+                for entity in entities:
+                    if chunk_id in self.index.get(entity, []):
+                        chunk_entities.append(entity)
+                
+                if chunk_entities:
+                    key = "_".join(sorted(chunk_entities))
+                    candidate_chunks.setdefault(key, []).append(chunk_id)
+        
+        # Apply entityaware_filter to get the best remaining chunks
+        if candidate_chunks:
+            try:
+                filtered_additional = self.entityaware_filter(candidate_chunks, entities)
+                
+                # Limit to remaining slots
+                additional_count = 0
+                for key, chunks in filtered_additional.items():
+                    if additional_count >= remaining_slots:
+                        break
+                        
+                    # Take only what we need
+                    chunks_to_take = min(len(chunks), remaining_slots - additional_count)
+                    if chunks_to_take > 0:
+                        current_results.setdefault(f"supplementary_{key}", []).extend(chunks[:chunks_to_take])
+                        additional_count += chunks_to_take
+            except Exception as e:
+                logger.error(f"Failed to apply entityaware_filter: {e}")
+        
+        return current_results
+
     def query(self, query, **kwargs):
         # step 1: extract the Entities from the query.
         # reuse the naive_extract_graph function, which is used in the graph building process.
@@ -432,6 +622,9 @@ class Retriever:
 
         # step 2.0: set up the parameters.
         shortest_path_k = kwargs.get("shortest_path_k", 4)
+        
+        # Check if hybrid retrieval is enabled (new parameter)
+        use_hybrid = kwargs.get("use_hybrid", True)
 
         # step 2.1: short circuit, if there is no entity, then return the naive dense retrieval.
         if len(entities) == 0:
@@ -443,6 +636,20 @@ class Retriever:
                 result["retrieval_type"] = "Global Search"
             return result
 
+        # NEW: Use hybrid retrieval strategy if enabled
+        if use_hybrid:
+            hybrid_results = self.hybrid_retrieval(query, entities, query=query, **kwargs)
+            result = {"chunks": self.format_res(hybrid_results)}
+            if kwargs.get("debug", True):
+                supplement_info = self._build_supplement_info(
+                    hybrid_results, entities, hybrid_results, 
+                    list(hybrid_results.keys()), self._count_chunks(hybrid_results), []
+                )
+                result.update(supplement_info)
+                result["retrieval_type"] = "Hybrid Primary-Auxiliary Collaborative Retrieval"
+            return result
+
+        # EXISTING CODE: Original retrieval strategy (fallback)
         # step 2.2: initialize the chunks by wasd method.
         local_res = self.local_retrieval(entities, shortest_path_k)
 
