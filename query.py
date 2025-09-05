@@ -459,22 +459,37 @@ class Retriever:
         Perform semantic search in the summary tree to find relevant high-level nodes and leaf nodes.
         Returns a dict with high_level_summaries and leaf_nodes separated.
         """
-        if self.embedder is None:
-            logger.warning("Embedder not available, falling back to empty tree results")
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Embedder or FAISS index not available, falling back to empty tree results")
             return {"high_level_summaries": {}, "leaf_nodes": {}}
             
         # Encode query for similarity search
-        query_embed = self.embedder.encode(query).reshape(1, -1)
+        try:
+            query_embed = self.embedder.encode(query).reshape(1, -1)
+        except Exception as e:
+            logger.error(f"Failed to encode query: {e}")
+            return {"high_level_summaries": {}, "leaf_nodes": {}}
         
         # Search in the collapsed tree (which contains all nodes)
-        _, candidate_indices = self.faiss_index.search(query_embed, k=min(k, len(self.collapse_tree_ids)))
-        candidate_indices = candidate_indices[0]
+        try:
+            search_k = min(k, len(self.collapse_tree_ids))
+            if search_k == 0:
+                return {"high_level_summaries": {}, "leaf_nodes": {}}
+                
+            _, candidate_indices = self.faiss_index.search(query_embed, k=search_k)
+            candidate_indices = candidate_indices[0]
+        except Exception as e:
+            logger.error(f"FAISS search failed: {e}")
+            return {"high_level_summaries": {}, "leaf_nodes": {}}
         
         # Separate results by node type 
         high_level_summaries = {}
         leaf_nodes = {}
         
         for idx in candidate_indices:
+            if idx >= len(self.collapse_tree_ids):
+                continue  # Skip invalid indices
+                
             chunk_id = self.collapse_tree_ids[idx]
             
             if chunk_id.startswith("leaf_"):
@@ -482,12 +497,17 @@ class Retriever:
                 leaf_nodes.setdefault("tree_leaf", []).append(chunk_id)
             elif chunk_id.startswith("summary_"):
                 # This is a summary node - determine its level
-                level = int(chunk_id.split("_")[1])
-                if level >= 1:  # Level 1 and above are considered "high-level"
-                    high_level_summaries.setdefault(f"high_level_{level}", []).append(chunk_id)
-                else:
-                    # Level 0 summaries are closer to leaves
-                    leaf_nodes.setdefault("tree_summary", []).append(chunk_id)
+                try:
+                    level = int(chunk_id.split("_")[1])
+                    if level >= 1:  # Level 1 and above are considered "high-level"
+                        high_level_summaries.setdefault(f"high_level_{level}", []).append(chunk_id)
+                    else:
+                        # Level 0 summaries are closer to leaves
+                        leaf_nodes.setdefault("tree_summary", []).append(chunk_id)
+                except (IndexError, ValueError):
+                    # Invalid chunk_id format, skip
+                    logger.warning(f"Invalid chunk_id format: {chunk_id}")
+                    continue
         
         return {"high_level_summaries": high_level_summaries, "leaf_nodes": leaf_nodes}
     
@@ -499,7 +519,8 @@ class Retriever:
         
         # Step 1: Keep ALL high-level summary nodes (these provide indispensable background)
         high_level_summaries = tree_results.get("high_level_summaries", {})
-        fused_results.update(high_level_summaries)
+        if high_level_summaries:
+            fused_results.update(high_level_summaries)
         
         # Step 2: Collect all leaf-level chunks from both sources
         all_leaf_chunks = set()
@@ -507,11 +528,13 @@ class Retriever:
         # From tree search (leaf nodes)
         tree_leaves = tree_results.get("leaf_nodes", {})
         for key, chunks in tree_leaves.items():
-            all_leaf_chunks.update(chunks)
+            if isinstance(chunks, list):
+                all_leaf_chunks.update(chunks)
         
         # From graph search  
         for key, chunks in graph_results.items():
-            all_leaf_chunks.update(chunks)
+            if isinstance(chunks, list):
+                all_leaf_chunks.update(chunks)
         
         # Step 3: Deduplicate leaf chunks - only keep one copy of each
         if all_leaf_chunks:
@@ -532,14 +555,32 @@ class Retriever:
             if isinstance(chunks, list):
                 selected_chunks.update(chunks)
         
+        # Only proceed if we have embedder and FAISS index
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Cannot supplement chunks: embedder or FAISS index not available")
+            return current_results
+        
         # Get additional candidates through dense retrieval
-        query_embed = self.embedder.encode(kwargs.get("query", "")).reshape(1, -1)
-        _, candidate_indices = self.faiss_index.search(query_embed, k=remaining_slots * 3)
-        candidate_indices = candidate_indices[0]
+        query = kwargs.get("query", "")
+        if not query:
+            logger.warning("No query provided for supplementary retrieval")
+            return current_results
+            
+        try:
+            query_embed = self.embedder.encode(query).reshape(1, -1)
+            search_k = min(remaining_slots * 3, len(self.collapse_tree_ids))
+            _, candidate_indices = self.faiss_index.search(query_embed, k=search_k)
+            candidate_indices = candidate_indices[0]
+        except Exception as e:
+            logger.error(f"Failed to get supplementary candidates: {e}")
+            return current_results
         
         # Filter out already selected chunks and create candidate dict
         candidate_chunks = {}
         for idx in candidate_indices:
+            if idx >= len(self.collapse_tree_ids):
+                continue
+                
             chunk_id = self.collapse_tree_ids[idx] 
             if chunk_id not in selected_chunks:
                 # Find which entities this chunk contains
@@ -554,19 +595,22 @@ class Retriever:
         
         # Apply entityaware_filter to get the best remaining chunks
         if candidate_chunks:
-            filtered_additional = self.entityaware_filter(candidate_chunks, entities)
-            
-            # Limit to remaining slots
-            additional_count = 0
-            for key, chunks in filtered_additional.items():
-                if additional_count >= remaining_slots:
-                    break
-                    
-                # Take only what we need
-                chunks_to_take = min(len(chunks), remaining_slots - additional_count)
-                if chunks_to_take > 0:
-                    current_results.setdefault(f"supplementary_{key}", []).extend(chunks[:chunks_to_take])
-                    additional_count += chunks_to_take
+            try:
+                filtered_additional = self.entityaware_filter(candidate_chunks, entities)
+                
+                # Limit to remaining slots
+                additional_count = 0
+                for key, chunks in filtered_additional.items():
+                    if additional_count >= remaining_slots:
+                        break
+                        
+                    # Take only what we need
+                    chunks_to_take = min(len(chunks), remaining_slots - additional_count)
+                    if chunks_to_take > 0:
+                        current_results.setdefault(f"supplementary_{key}", []).extend(chunks[:chunks_to_take])
+                        additional_count += chunks_to_take
+            except Exception as e:
+                logger.error(f"Failed to apply entityaware_filter: {e}")
         
         return current_results
 
