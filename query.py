@@ -425,6 +425,91 @@ class Retriever:
         return filtered_res
 
     def query(self, query, **kwargs):
+        """
+        New dual retrieval strategy implementation:
+        1. Primary retrieval using summary tree (semantic search)
+        2. Auxiliary retrieval using entity graph
+        3. Result fusion and deduplication
+        4. Supplementary chunk ranking and addition
+        """
+        # Step 1: Extract entities from the query
+        entities = self.nlp.naive_extract_graph(query.split("\n")[0])
+        entities = entities["nouns"]
+        
+        # Set up parameters
+        max_chunk_setting = kwargs.get("max_chunk_setting", 25)
+        entity_k = kwargs.get("entity_k", 4)  # Max entities for graph retrieval
+        
+        # Step 1: Primary retrieval using summary tree (以摘要树为主检索)
+        tree_k = max_chunk_setting  # Initially retrieve more candidates
+        tree_results = self.tree_based_retrieval(query, tree_k)
+        
+        # Step 2: Auxiliary retrieval using entity graph (以实体图为辅助检索)
+        graph_results = {"selected_entities": [], "graph_chunks": {}}
+        if entities:
+            graph_results = self.graph_based_retrieval(entities, entity_k)
+        
+        # Step 3: Result fusion and deduplication (结果融合与去冗余)
+        merged_chunks = self.deduplicate_and_merge(tree_results, graph_results)
+        
+        # Count current chunks
+        current_chunk_count = sum(len(chunks) if isinstance(chunks, list) else 1 
+                                for chunks in merged_chunks.values())
+        
+        # Step 4: Supplementary chunk addition if needed (剩余chunk的补充)
+        final_result = merged_chunks.copy()
+        
+        if current_chunk_count < max_chunk_setting:
+            remaining_slots = max_chunk_setting - current_chunk_count
+            
+            # Get additional candidates from dense retrieval
+            additional_candidates = self.dense_retrieval(query, tree_k * 2)
+            all_additional = []
+            for chunks in additional_candidates.values():
+                all_additional.extend(chunks)
+            
+            # Remove already selected chunks
+            already_selected = set()
+            for chunks in merged_chunks.values():
+                if isinstance(chunks, list):
+                    already_selected.update(chunks)
+                else:
+                    already_selected.add(chunks)
+            
+            remaining_candidates = [c for c in all_additional if c not in already_selected]
+            
+            # Rank supplementary chunks by the 3-tier priority system
+            if remaining_candidates and entities:
+                supplementary_chunks = self.rank_supplementary_chunks(
+                    remaining_candidates, entities, remaining_slots
+                )
+                if supplementary_chunks:
+                    final_result["supplementary"] = supplementary_chunks
+        
+        # Format the result
+        res_str = self.format_res(final_result)
+        
+        # Build response
+        result = {"chunks": res_str}
+        
+        if kwargs.get("debug", True):
+            supplement_info = self._build_supplement_info(
+                final_result, entities, final_result, list(final_result.keys()), 
+                sum(len(chunks) if isinstance(chunks, list) else 1 
+                    for chunks in final_result.values()), 
+                []
+            )
+            result.update(supplement_info)
+            result["retrieval_type"] = "Dual Strategy (Tree + Graph)"
+            result["tree_results"] = tree_results
+            result["graph_results"] = graph_results
+        
+        return result
+
+    def query_legacy(self, query, **kwargs):
+        """
+        Legacy query method - kept for backward compatibility
+        """
         # step 1: extract the Entities from the query.
         # reuse the naive_extract_graph function, which is used in the graph building process.
         entities = self.nlp.naive_extract_graph(query.split("\n")[0])
@@ -509,6 +594,155 @@ class Retriever:
                 result.update(supplement_info)
                 result["retrieval_type"] = f"EntityAware Filter, Loop for {len(chunk_counts_history)-1} times"
             return result        
+
+    def tree_based_retrieval(self, query, k):
+        """
+        Primary retrieval using summary tree - semantic search in the summary tree
+        to find relevant high-level nodes and leaf nodes
+        """
+        query_embed = self.embedder.encode(query).reshape(1, -1)
+        _, candidate_indices = self.faiss_index.search(query_embed, k=k)
+        candidate_indices = candidate_indices[0]
+        
+        high_level_summaries = []
+        leaf_nodes = []
+        
+        for idx in candidate_indices:
+            chunk_id = self.collapse_tree_ids[idx]
+            if chunk_id.startswith("leaf_"):
+                leaf_nodes.append(chunk_id)
+            else:
+                # This is a summary node (high-level)
+                high_level_summaries.append(chunk_id)
+        
+        return {
+            "high_level_summaries": high_level_summaries,
+            "leaf_nodes": leaf_nodes
+        }
+    
+    def graph_based_retrieval(self, entities, k=4):
+        """
+        Auxiliary retrieval using entity graph - search in entity graph for entities
+        mentioned in query and their relationship network (up to k entities)
+        """
+        # Use existing local_retrieval but limit to k entities
+        if len(entities) > k:
+            # Select top k entities based on appearance count
+            entity_counts = []
+            for entity in entities:
+                total_count = 0
+                if entity in self.appearance_count:
+                    total_count = sum(self.appearance_count[entity].values()) if isinstance(self.appearance_count[entity], dict) else self.appearance_count[entity]
+                else:
+                    # Check in chunks
+                    for chunk_id, counts in self.appearance_count.items():
+                        if isinstance(counts, dict) and entity in counts:
+                            total_count += counts[entity]
+                entity_counts.append((entity, total_count))
+            
+            # Sort by count and take top k
+            entity_counts.sort(key=lambda x: x[1], reverse=True)
+            selected_entities = [entity for entity, _ in entity_counts[:k]]
+        else:
+            selected_entities = entities
+        
+        # Get chunks related to these entities
+        graph_chunks = self.local_retrieval(selected_entities, shortest_path_k=4)
+        
+        return {
+            "selected_entities": selected_entities,
+            "graph_chunks": graph_chunks
+        }
+    
+    def deduplicate_and_merge(self, tree_results, graph_results):
+        """
+        Result fusion and deduplication:
+        - Keep all high-level summary nodes (essential background framework)
+        - Keep overlapping parts between leaf nodes (from tree) and chunks (from graph)
+        """
+        # Always keep high-level summaries
+        final_chunks = {}
+        
+        # Add high-level summaries with special key
+        if tree_results["high_level_summaries"]:
+            final_chunks["high_level_summaries"] = tree_results["high_level_summaries"]
+        
+        # Get all unique chunks from both sources
+        all_leaf_nodes = set(tree_results["leaf_nodes"])
+        all_graph_chunks = set()
+        
+        for chunks_list in graph_results["graph_chunks"].values():
+            all_graph_chunks.update(chunks_list)
+        
+        # Find overlapping chunks (intersection) - these are kept
+        overlapping_chunks = all_leaf_nodes.intersection(all_graph_chunks)
+        
+        if overlapping_chunks:
+            final_chunks["overlapping_chunks"] = list(overlapping_chunks)
+        
+        # Add remaining unique chunks from both sources
+        unique_leaf_nodes = all_leaf_nodes - overlapping_chunks
+        unique_graph_chunks = all_graph_chunks - overlapping_chunks
+        
+        if unique_leaf_nodes:
+            final_chunks["tree_unique"] = list(unique_leaf_nodes)
+        
+        if unique_graph_chunks:
+            final_chunks["graph_unique"] = list(unique_graph_chunks)
+        
+        return final_chunks
+    
+    def rank_supplementary_chunks(self, candidate_chunks, entities, max_slots):
+        """
+        Rank remaining chunks by priority:
+        1. Chunks containing more different entities have higher priority
+        2. Chunks with more neighbor nodes have higher priority  
+        3. Chunks with higher entity appearance frequency have higher priority
+        """
+        chunk_scores = []
+        
+        # Convert candidate_chunks to flat list if it's a dict
+        if isinstance(candidate_chunks, dict):
+            flat_chunks = []
+            for chunks_list in candidate_chunks.values():
+                flat_chunks.extend(chunks_list)
+            candidate_chunks = list(set(flat_chunks))  # Remove duplicates
+        
+        for chunk_id in candidate_chunks:
+            if not chunk_id.startswith("leaf_"):
+                continue  # Skip non-leaf nodes
+                
+            # Priority 1: Count different entities in this chunk
+            chunk_entities = set()
+            if chunk_id in self.appearance_count:
+                chunk_appearance = self.appearance_count[chunk_id]
+                if isinstance(chunk_appearance, dict):
+                    chunk_entities = set(chunk_appearance.keys()).intersection(set(entities))
+            
+            entity_diversity = len(chunk_entities)
+            
+            # Priority 2: Count neighbor nodes
+            neighbor_count = len(self._detect_neighbor_nodes(chunk_entities, chunk_id)) if chunk_entities else 0
+            
+            # Priority 3: Sum of entity appearance frequencies
+            appearance_frequency = 0
+            if chunk_id in self.appearance_count and isinstance(self.appearance_count[chunk_id], dict):
+                for entity in entities:
+                    appearance_frequency += self.appearance_count[chunk_id].get(entity, 0)
+            
+            chunk_scores.append({
+                "chunk_id": chunk_id,
+                "entity_diversity": entity_diversity,
+                "neighbor_count": neighbor_count,  
+                "appearance_frequency": appearance_frequency
+            })
+        
+        # Sort by priorities (descending order)
+        chunk_scores.sort(key=lambda x: (x["entity_diversity"], x["neighbor_count"], x["appearance_frequency"]), reverse=True)
+        
+        # Return top max_slots chunks
+        top_chunks = chunk_scores[:max_slots]
+        return [chunk["chunk_id"] for chunk in top_chunks]
 
     def _build_supplement_info(self, chunk_ids, entities, neighbor_nodes, keys, len_chunks, chunk_counts_history):
         return {
