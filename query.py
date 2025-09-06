@@ -295,6 +295,29 @@ class Retriever:
                 res_str += "{}: {}\n".format(key, str_of_list)
         return res_str
     
+    def format_hybrid_res(self, hybrid_res: Dict[str, List[str]]) -> str:
+        """Format hybrid retrieval results including both summary and detail chunks."""
+        res_str = ""
+        
+        # Format high-level summary nodes first (they provide essential context)
+        if "summary_nodes" in hybrid_res and hybrid_res["summary_nodes"]:
+            summary_texts = []
+            for summary_node in hybrid_res["summary_nodes"]:
+                summary_text = self.cache_tree[summary_node]["text"]
+                summary_texts.append(summary_text)
+            merged_summary = sequential_merge(summary_texts, self.tokenizer, self.overlap)
+            res_str += "Context Summary: {}\n".format(merged_summary)
+        
+        # Format detail chunks (leaf nodes from tree and chunks from graph)
+        if "detail_chunks" in hybrid_res and hybrid_res["detail_chunks"]:
+            # Group chunks by contiguity for better readability
+            chunks = self.detect_contiguous_chunks(hybrid_res["detail_chunks"])
+            for chunk_list in chunks:
+                str_of_list = self.get_contiguous_chunks(chunk_list)
+                res_str += "Details: {}\n".format(str_of_list)
+        
+        return res_str
+    
     def str_chunkid_2_int_chunkid(self, str_chunk:str) -> int:
         return int(str_chunk.split("_")[-1])
 
@@ -319,12 +342,131 @@ class Retriever:
         res = {"": condidate_chunk_ids}
         return res
 
+    def tree_semantic_search(self, query: str, k: int = 25) -> Dict[str, List[str]]:
+        """
+        Perform semantic search in the summary tree to find relevant high-level nodes and leaf nodes.
+        Returns both summary nodes (for context) and leaf nodes (for detail).
+        """
+        # Prepare all nodes for semantic search
+        all_nodes = []
+        all_node_ids = []
+        summary_nodes = []
+        leaf_nodes = []
+        
+        for node_id, node_data in self.cache_tree.items():
+            all_nodes.append(node_data["text"])
+            all_node_ids.append(node_id)
+            
+            if node_id.startswith("summary_"):
+                summary_nodes.append(node_id)
+            elif node_id.startswith("leaf_"):
+                leaf_nodes.append(node_id)
+        
+        # Encode query and all nodes
+        query_embed = self.embedder.encode([query])
+        node_embeds = self.embedder.encode(all_nodes, batch_size=16)
+        
+        # Calculate similarities
+        similarities = np.dot(query_embed, node_embeds.T)[0]
+        
+        # Get top-k most similar nodes
+        top_indices = np.argsort(similarities)[::-1][:k*2]  # Get more candidates initially
+        
+        # Separate summary and leaf nodes from top results
+        selected_summary_nodes = []
+        selected_leaf_nodes = []
+        
+        for idx in top_indices:
+            node_id = all_node_ids[idx]
+            if node_id.startswith("summary_"):
+                # Extract level from summary node ID (format: summary_level_id)
+                level = int(node_id.split("_")[1])
+                # Prioritize higher level (more abstract) summary nodes
+                selected_summary_nodes.append((node_id, similarities[idx], level))
+            elif node_id.startswith("leaf_"):
+                selected_leaf_nodes.append((node_id, similarities[idx]))
+        
+        # Sort summary nodes by level (higher level = more abstract = higher priority)
+        selected_summary_nodes.sort(key=lambda x: (-x[2], -x[1]))  # Sort by level desc, then similarity desc
+        selected_leaf_nodes.sort(key=lambda x: -x[1])  # Sort by similarity desc
+        
+        # Take top summary and leaf nodes
+        final_summary_nodes = [node[0] for node in selected_summary_nodes[:k//3]]  # ~1/3 for summaries
+        final_leaf_nodes = [node[0] for node in selected_leaf_nodes[:k*2//3]]  # ~2/3 for leaves
+        
+        # Return in the expected format
+        result = {}
+        if final_summary_nodes:
+            result["summary_nodes"] = final_summary_nodes
+        if final_leaf_nodes:
+            result["leaf_nodes"] = final_leaf_nodes
+            
+        return result
+
     def _count_chunks(self, res:Dict[str, List[str]]) -> int:
         # count the chunks.
         count = 0
         for chunk_ids in res.values():
             count += len(chunk_ids)
         return count
+
+    def fuse_and_deduplicate(self, tree_results: Dict[str, List[str]], graph_results: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """
+        Fuse tree and graph retrieval results with deduplication.
+        - Keep all high-level summary nodes (they provide essential context)
+        - Deduplicate overlapping leaf nodes/chunks between tree and graph results
+        """
+        fused_results = {}
+        
+        # Always preserve high-level summary nodes from tree results
+        if "summary_nodes" in tree_results:
+            fused_results["summary_nodes"] = tree_results["summary_nodes"]
+        
+        # Collect all leaf nodes/chunks from both sources
+        all_leaf_chunks = set()
+        
+        # Add leaf nodes from tree results
+        if "leaf_nodes" in tree_results:
+            for leaf_node in tree_results["leaf_nodes"]:
+                all_leaf_chunks.add(leaf_node)
+        
+        # Add chunks from graph results, avoiding duplicates
+        for key, chunk_list in graph_results.items():
+            for chunk in chunk_list:
+                all_leaf_chunks.add(chunk)
+        
+        # Convert back to list and group by entity relationships if needed
+        if all_leaf_chunks:
+            # For leaf chunks, we can group them or keep them as a single category
+            fused_results["detail_chunks"] = list(all_leaf_chunks)
+        
+        return fused_results
+
+    def hybrid_retrieval(self, query: str, entities: List[str], **kwargs) -> Dict[str, List[str]]:
+        """
+        Implement the hybrid retrieval strategy:
+        1. Primary: Tree-based semantic search for high-level context and relevant leaf nodes
+        2. Auxiliary: Entity graph search for precise facts (limited to shortest_path_k=4)
+        3. Fusion: Combine and deduplicate results
+        """
+        shortest_path_k = kwargs.get("shortest_path_k", 4)
+        max_chunks = kwargs.get("max_chunk_setting", 25)
+        
+        # Step 1: Primary retrieval from summary tree
+        tree_results = self.tree_semantic_search(query, k=max_chunks)
+        logger.debug(f"Tree retrieval results: {len(tree_results.get('summary_nodes', []))} summary nodes, "
+                    f"{len(tree_results.get('leaf_nodes', []))} leaf nodes")
+        
+        # Step 2: Auxiliary retrieval from entity graph (only if entities exist)
+        graph_results = {}
+        if entities:
+            graph_results = self.local_retrieval(entities, shortest_path_k)
+            logger.debug(f"Graph retrieval results: {self._count_chunks(graph_results)} chunks")
+        
+        # Step 3: Fuse and deduplicate results
+        fused_results = self.fuse_and_deduplicate(tree_results, graph_results)
+        
+        return fused_results
 
     def entityaware_filter(self, candidate_chunks:Dict[str, List[str]], entities:List[str]) -> Dict[str, List[str]]:
         # filter rules:
@@ -433,82 +575,22 @@ class Retriever:
         # step 2.0: set up the parameters.
         shortest_path_k = kwargs.get("shortest_path_k", 4)
 
-        # step 2.1: short circuit, if there is no entity, then return the naive dense retrieval.
-        if len(entities) == 0:
-            chunk_ids = self.dense_retrieval(query, kwargs.get("max_chunk_setting", 25))
-            result = {"chunks":self.format_res(chunk_ids)}
-            if kwargs.get("debug", True):
-                supplement_info = self._build_supplement_info(chunk_ids, entities, chunk_ids, list(chunk_ids.keys()), len(chunk_ids), [])
-                result.update(supplement_info)
-                result["retrieval_type"] = "Global Search"
-            return result
-
-        # step 2.2: initialize the chunks by wasd method.
-        local_res = self.local_retrieval(entities, shortest_path_k)
-
-        # step 2.2: check the result.
-            # if the chunk count is larger than the max chunk setting, then change the setting, decrease the shortest path k, until the chunk count is less than the max chunk setting.
-            # if the chunk count is 0, take it as dense retrieval.
-    
-        chunk_count = self._count_chunks(local_res)
-        # record the chunk count history, for debug.
-        chunk_counts_history = []
-        chunk_counts_history.append((shortest_path_k, chunk_count))
-
-        # if the chunk count is 0, occurrence ranking.
-        if chunk_count == 0:          
-            query_embed = self.embedder.encode(query).reshape(1, -1)
-            # retrieve the top 2 k chunks.
-            _, condidate_chunks_indexs = self.faiss_index.search(query_embed, k = kwargs.get("max_chunk_setting", 25)*2)
-            condidate_chunks_indexs = condidate_chunks_indexs[0]
-            condidate_chunk_ids = [self.collapse_tree_ids[i] for i in condidate_chunks_indexs]
-            filtered_chunk_ids = self.occurrence_ranking(condidate_chunk_ids, entities) 
-            # return the entity_entityB: [chunk_id1, chunk_id2, ...]
-            res_str = self.format_res(filtered_chunk_ids)
-
-            result = {"chunks":res_str}
-            if kwargs.get("debug", True):
-                supplement_info = self._build_supplement_info(filtered_chunk_ids, entities, filtered_chunk_ids, list(filtered_chunk_ids.keys()), 25, chunk_counts_history)
-                result.update(supplement_info)
-                result["retrieval_type"] = "Occurrence Rerank"
-            return result
+        # Use hybrid retrieval strategy as the primary approach
+        # This implements the requirements: tree-based primary + graph-based auxiliary retrieval
+        hybrid_results = self.hybrid_retrieval(query, entities, **kwargs)
+        result_str = self.format_hybrid_res(hybrid_results)
         
-        while chunk_count > kwargs.get("max_chunk_setting", 25):
-            prev_local_res = copy.deepcopy(local_res)
-            # if the chunk count is larger than the max chunk setting
-            # then change the setting, increase the min count and decrease the shortest path k.
-            shortest_path_k -= 1
-            # update the result with new restrictions.
-            local_res = self.local_retrieval(entities, shortest_path_k)
-            chunk_count = self._count_chunks(local_res)
-            chunk_counts_history.append((shortest_path_k, chunk_count))
-
-        # if the chunk count is 0, dense retrieval + entity filter.
-        # if the chunk count is not 0, return the result.
-        if chunk_count != 0:
-            # format the result.
-            logger.debug(f"BOTTOM2TOP: final chunk_count {chunk_count}")
-            res_str = self.format_res(local_res)
-
-            result = {"chunks":res_str}
-            if kwargs.get("debug", True):
-                supplement_info = self._build_supplement_info(local_res, entities, local_res, list(local_res.keys()), chunk_count, chunk_counts_history)
-                result.update(supplement_info)
-                result["retrieval_type"] = f"Local, Loop for {len(chunk_counts_history)-1} times"
-            return result
-        else:
-            # the previous local result is not empty, so we can use it as candidate chunks.
-            candidate_chunks = prev_local_res
-            res_ids = self.entityaware_filter(candidate_chunks, entities)
-            chunk_count = self._count_chunks(res_ids)
-            res_str = self.format_res(res_ids)
-            result = {"chunks":res_str}
-            result["chunk_counts_history"] = chunk_counts_history
-            if kwargs.get("debug", True):
-                supplement_info = self._build_supplement_info(res_ids, entities, res_ids, list(res_ids.keys()), 25, chunk_counts_history)
-                result.update(supplement_info)
-                result["retrieval_type"] = f"EntityAware Filter, Loop for {len(chunk_counts_history)-1} times"
-            return result        
+        result = {"chunks": result_str}
+        if kwargs.get("debug", True):
+            # Provide debug info in compatible format
+            chunk_count = len(hybrid_results.get("summary_nodes", [])) + len(hybrid_results.get("detail_chunks", []))
+            supplement_info = self._build_supplement_info(
+                hybrid_results, entities, hybrid_results, 
+                list(hybrid_results.keys()), chunk_count, []
+            )
+            result.update(supplement_info)
+            result["retrieval_type"] = "Hybrid Search (Tree Primary + Graph Auxiliary)"
+        return result
 
     def _build_supplement_info(self, chunk_ids, entities, neighbor_nodes, keys, len_chunks, chunk_counts_history):
         return {
