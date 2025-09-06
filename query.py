@@ -313,12 +313,13 @@ class Retriever:
         """
         Hybrid retrieval strategy: Primary tree retrieval + auxiliary entity graph retrieval
         
+        According to the requirements:
+        1. Primary: semantic search in summary tree (high-level + leaf nodes)
+        2. Auxiliary: entity graph retrieval (within shortest_path_k=4)
+        3. Fusion: keep all high-level summaries + overlapping chunks between tree and graph
+        
         Returns:
-            Dict with keys:
-            - "overlapping_chunks": chunks that appear in both tree and graph retrieval
-            - "high_level_summaries": high-level summary nodes from tree
-            - "tree_only": leaf nodes only found in tree retrieval
-            - "graph_only": chunks only found in graph retrieval
+            Dict formatted for compatibility with existing format_res method
         """
         logger.debug(f"Starting hybrid retrieval for query: {query[:100]}...")
         
@@ -330,10 +331,13 @@ class Retriever:
         logger.debug(f"Tree retrieval found {len(tree_leaf_nodes)} leaf nodes, {len(high_level_summaries)} high-level summaries")
         
         # Step 2: Auxiliary retrieval - entity graph retrieval (limit to shortest_path_k=4)
-        graph_results = self.local_retrieval(entities, shortest_path_k)
-        graph_chunks = set()
-        for chunk_list in graph_results.values():
-            graph_chunks.update(chunk_list)
+        if entities:
+            graph_results = self.local_retrieval(entities, shortest_path_k)
+            graph_chunks = set()
+            for chunk_list in graph_results.values():
+                graph_chunks.update(chunk_list)
+        else:
+            graph_chunks = set()
         
         logger.debug(f"Graph retrieval found {len(graph_chunks)} chunks")
         
@@ -341,29 +345,27 @@ class Retriever:
         # Find overlapping chunks between tree leaf nodes and graph chunks
         overlapping_chunks = tree_leaf_nodes.intersection(graph_chunks)
         
-        # Get non-overlapping parts for analysis
-        tree_only = tree_leaf_nodes - graph_chunks
-        graph_only = graph_chunks - tree_leaf_nodes
-        
         logger.debug(f"Found {len(overlapping_chunks)} overlapping chunks")
-        logger.debug(f"Tree-only: {len(tree_only)}, Graph-only: {len(graph_only)}")
         
-        # Step 4: Form final candidate set: "overlapping chunks + high-level summaries"
-        final_results = {
-            "overlapping_chunks": list(overlapping_chunks),
-            "high_level_summaries": high_level_summaries,
-            "tree_only": list(tree_only),
-            "graph_only": list(graph_only)
-        }
-        
-        # Format for compatibility with existing system
+        # Step 4: Form final candidate set according to requirements:
+        # "重合chunk+高级别摘要" (overlapping chunks + high-level summaries)
         formatted_results = {}
-        if overlapping_chunks:
-            formatted_results["overlapping"] = list(overlapping_chunks)
+        
+        # Add high-level summaries (always keep these as they provide essential background)
         if high_level_summaries:
             formatted_results["summaries"] = high_level_summaries
         
-        return formatted_results if formatted_results else {"": list(overlapping_chunks)[:max_chunks]}
+        # Add overlapping chunks (the intersection between tree and graph)
+        if overlapping_chunks:
+            formatted_results["overlapping"] = list(overlapping_chunks)
+        
+        # If no overlapping chunks but we have tree results, fall back to tree-only results
+        # This ensures we don't return empty results when tree retrieval finds relevant content
+        if not overlapping_chunks and tree_leaf_nodes:
+            logger.debug("No overlapping chunks found, using tree leaf nodes as fallback")
+            formatted_results["tree_fallback"] = list(tree_leaf_nodes)[:max_chunks//2]
+        
+        return formatted_results
 
     def dense_retrieval(self, query,k):
         # using dense retrieval to get the chunks.
@@ -380,38 +382,48 @@ class Retriever:
         Primary retrieval using summary tree: semantic search across all tree levels
         Returns both high-level summary nodes and relevant leaf nodes
         """
-        if self.embedder is None:
-            logger.warning("No embedder available for tree semantic retrieval")
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("No embedder or faiss index available for tree semantic retrieval")
             return {"high_level_summaries": [], "leaf_nodes": []}
         
-        query_embed = self.embedder.encode(query).reshape(1, -1)
-        _, candidate_indices = self.faiss_index.search(query_embed, k=k*2)  # Get more candidates
-        candidate_indices = candidate_indices[0]
-        candidate_chunk_ids = [self.collapse_tree_ids[i] for i in candidate_indices]
-        
-        # Separate high-level summaries and leaf nodes
-        high_level_summaries = []
-        leaf_nodes = []
-        
-        for chunk_id in candidate_chunk_ids:
-            if chunk_id.startswith("summary_"):
-                # Extract level from summary_level_id format
-                level = int(chunk_id.split("_")[1])
-                if level > 0:  # High-level summaries (level 1 and above)
-                    high_level_summaries.append(chunk_id)
-                else:  # Level 0 summaries are close to leaf nodes
+        try:
+            query_embed = self.embedder.encode(query).reshape(1, -1)
+            _, candidate_indices = self.faiss_index.search(query_embed, k=min(k*2, len(self.collapse_tree_ids)))
+            candidate_indices = candidate_indices[0]
+            candidate_chunk_ids = [self.collapse_tree_ids[i] for i in candidate_indices if i < len(self.collapse_tree_ids)]
+            
+            # Separate high-level summaries and leaf nodes
+            high_level_summaries = []
+            leaf_nodes = []
+            
+            for chunk_id in candidate_chunk_ids:
+                if chunk_id.startswith("summary_"):
+                    try:
+                        # Extract level from summary_level_id format
+                        level = int(chunk_id.split("_")[1])
+                        if level > 0:  # High-level summaries (level 1 and above)
+                            high_level_summaries.append(chunk_id)
+                        else:  # Level 0 summaries are close to leaf nodes
+                            leaf_nodes.append(chunk_id)
+                    except (ValueError, IndexError):
+                        logger.warning(f"Invalid chunk_id format: {chunk_id}")
+                        continue
+                elif chunk_id.startswith("leaf_"):
                     leaf_nodes.append(chunk_id)
-            elif chunk_id.startswith("leaf_"):
-                leaf_nodes.append(chunk_id)
-        
-        # Limit results while preserving balance
-        max_high_level = min(len(high_level_summaries), k//2)
-        max_leaf = min(len(leaf_nodes), k - max_high_level)
-        
-        return {
-            "high_level_summaries": high_level_summaries[:max_high_level],
-            "leaf_nodes": leaf_nodes[:max_leaf]
-        }
+            
+            # Limit results while preserving balance
+            max_high_level = min(len(high_level_summaries), k//2)
+            max_leaf = min(len(leaf_nodes), k - max_high_level)
+            
+            logger.debug(f"Tree semantic retrieval: {max_high_level} high-level, {max_leaf} leaf nodes")
+            
+            return {
+                "high_level_summaries": high_level_summaries[:max_high_level],
+                "leaf_nodes": leaf_nodes[:max_leaf]
+            }
+        except Exception as e:
+            logger.error(f"Error in tree_semantic_retrieval: {e}")
+            return {"high_level_summaries": [], "leaf_nodes": []}
 
     def _count_chunks(self, res:Dict[str, List[str]]) -> int:
         # count the chunks.
