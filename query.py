@@ -309,6 +309,62 @@ class Retriever:
         neighbor_nodes = self.merge_keys(init_chunk_ids)
         return neighbor_nodes
 
+    def hybrid_retrieval(self, query, entities:List[str], shortest_path_k:int=4, max_chunks:int=25):
+        """
+        Hybrid retrieval strategy: Primary tree retrieval + auxiliary entity graph retrieval
+        
+        Returns:
+            Dict with keys:
+            - "overlapping_chunks": chunks that appear in both tree and graph retrieval
+            - "high_level_summaries": high-level summary nodes from tree
+            - "tree_only": leaf nodes only found in tree retrieval
+            - "graph_only": chunks only found in graph retrieval
+        """
+        logger.debug(f"Starting hybrid retrieval for query: {query[:100]}...")
+        
+        # Step 1: Primary retrieval - semantic search in summary tree
+        tree_results = self.tree_semantic_retrieval(query, k=max_chunks)
+        tree_leaf_nodes = set(tree_results["leaf_nodes"])
+        high_level_summaries = tree_results["high_level_summaries"]
+        
+        logger.debug(f"Tree retrieval found {len(tree_leaf_nodes)} leaf nodes, {len(high_level_summaries)} high-level summaries")
+        
+        # Step 2: Auxiliary retrieval - entity graph retrieval (limit to shortest_path_k=4)
+        graph_results = self.local_retrieval(entities, shortest_path_k)
+        graph_chunks = set()
+        for chunk_list in graph_results.values():
+            graph_chunks.update(chunk_list)
+        
+        logger.debug(f"Graph retrieval found {len(graph_chunks)} chunks")
+        
+        # Step 3: Result fusion and deduplication
+        # Find overlapping chunks between tree leaf nodes and graph chunks
+        overlapping_chunks = tree_leaf_nodes.intersection(graph_chunks)
+        
+        # Get non-overlapping parts for analysis
+        tree_only = tree_leaf_nodes - graph_chunks
+        graph_only = graph_chunks - tree_leaf_nodes
+        
+        logger.debug(f"Found {len(overlapping_chunks)} overlapping chunks")
+        logger.debug(f"Tree-only: {len(tree_only)}, Graph-only: {len(graph_only)}")
+        
+        # Step 4: Form final candidate set: "overlapping chunks + high-level summaries"
+        final_results = {
+            "overlapping_chunks": list(overlapping_chunks),
+            "high_level_summaries": high_level_summaries,
+            "tree_only": list(tree_only),
+            "graph_only": list(graph_only)
+        }
+        
+        # Format for compatibility with existing system
+        formatted_results = {}
+        if overlapping_chunks:
+            formatted_results["overlapping"] = list(overlapping_chunks)
+        if high_level_summaries:
+            formatted_results["summaries"] = high_level_summaries
+        
+        return formatted_results if formatted_results else {"": list(overlapping_chunks)[:max_chunks]}
+
     def dense_retrieval(self, query,k):
         # using dense retrieval to get the chunks.
         query_embed = self.embedder.encode(query).reshape(1, -1) # need (1, -1) for faiss.
@@ -318,6 +374,44 @@ class Retriever:
         condidate_chunk_ids = [self.collapse_tree_ids[i] for i in condidate_chunks_indexs]
         res = {"": condidate_chunk_ids}
         return res
+
+    def tree_semantic_retrieval(self, query, k=25):
+        """
+        Primary retrieval using summary tree: semantic search across all tree levels
+        Returns both high-level summary nodes and relevant leaf nodes
+        """
+        if self.embedder is None:
+            logger.warning("No embedder available for tree semantic retrieval")
+            return {"high_level_summaries": [], "leaf_nodes": []}
+        
+        query_embed = self.embedder.encode(query).reshape(1, -1)
+        _, candidate_indices = self.faiss_index.search(query_embed, k=k*2)  # Get more candidates
+        candidate_indices = candidate_indices[0]
+        candidate_chunk_ids = [self.collapse_tree_ids[i] for i in candidate_indices]
+        
+        # Separate high-level summaries and leaf nodes
+        high_level_summaries = []
+        leaf_nodes = []
+        
+        for chunk_id in candidate_chunk_ids:
+            if chunk_id.startswith("summary_"):
+                # Extract level from summary_level_id format
+                level = int(chunk_id.split("_")[1])
+                if level > 0:  # High-level summaries (level 1 and above)
+                    high_level_summaries.append(chunk_id)
+                else:  # Level 0 summaries are close to leaf nodes
+                    leaf_nodes.append(chunk_id)
+            elif chunk_id.startswith("leaf_"):
+                leaf_nodes.append(chunk_id)
+        
+        # Limit results while preserving balance
+        max_high_level = min(len(high_level_summaries), k//2)
+        max_leaf = min(len(leaf_nodes), k - max_high_level)
+        
+        return {
+            "high_level_summaries": high_level_summaries[:max_high_level],
+            "leaf_nodes": leaf_nodes[:max_leaf]
+        }
 
     def _count_chunks(self, res:Dict[str, List[str]]) -> int:
         # count the chunks.
@@ -432,10 +526,12 @@ class Retriever:
 
         # step 2.0: set up the parameters.
         shortest_path_k = kwargs.get("shortest_path_k", 4)
+        max_chunk_setting = kwargs.get("max_chunk_setting", 25)
+        use_hybrid = kwargs.get("use_hybrid", True)  # Enable hybrid retrieval by default
 
         # step 2.1: short circuit, if there is no entity, then return the naive dense retrieval.
         if len(entities) == 0:
-            chunk_ids = self.dense_retrieval(query, kwargs.get("max_chunk_setting", 25))
+            chunk_ids = self.dense_retrieval(query, max_chunk_setting)
             result = {"chunks":self.format_res(chunk_ids)}
             if kwargs.get("debug", True):
                 supplement_info = self._build_supplement_info(chunk_ids, entities, chunk_ids, list(chunk_ids.keys()), len(chunk_ids), [])
@@ -443,7 +539,24 @@ class Retriever:
                 result["retrieval_type"] = "Global Search"
             return result
 
-        # step 2.2: initialize the chunks by wasd method.
+        # step 2.2: Use hybrid retrieval strategy if enabled
+        if use_hybrid:
+            hybrid_results = self.hybrid_retrieval(query, entities, shortest_path_k, max_chunk_setting)
+            chunk_count = self._count_chunks(hybrid_results)
+            
+            # If hybrid retrieval returns good results, use them
+            if chunk_count > 0:
+                res_str = self.format_res(hybrid_results)
+                result = {"chunks": res_str}
+                if kwargs.get("debug", True):
+                    supplement_info = self._build_supplement_info(hybrid_results, entities, hybrid_results, list(hybrid_results.keys()), chunk_count, [])
+                    result.update(supplement_info)
+                    result["retrieval_type"] = "Hybrid Retrieval (Tree + Graph)"
+                return result
+            else:
+                logger.debug("Hybrid retrieval returned no results, falling back to original strategy")
+
+        # step 2.2: original strategy - initialize the chunks by wasd method.
         local_res = self.local_retrieval(entities, shortest_path_k)
 
         # step 2.2: check the result.
@@ -459,7 +572,7 @@ class Retriever:
         if chunk_count == 0:          
             query_embed = self.embedder.encode(query).reshape(1, -1)
             # retrieve the top 2 k chunks.
-            _, condidate_chunks_indexs = self.faiss_index.search(query_embed, k = kwargs.get("max_chunk_setting", 25)*2)
+            _, condidate_chunks_indexs = self.faiss_index.search(query_embed, k = max_chunk_setting*2)
             condidate_chunks_indexs = condidate_chunks_indexs[0]
             condidate_chunk_ids = [self.collapse_tree_ids[i] for i in condidate_chunks_indexs]
             filtered_chunk_ids = self.occurrence_ranking(condidate_chunk_ids, entities) 
@@ -473,7 +586,7 @@ class Retriever:
                 result["retrieval_type"] = "Occurrence Rerank"
             return result
         
-        while chunk_count > kwargs.get("max_chunk_setting", 25):
+        while chunk_count > max_chunk_setting:
             prev_local_res = copy.deepcopy(local_res)
             # if the chunk count is larger than the max chunk setting
             # then change the setting, increase the min count and decrease the shortest path k.
@@ -508,7 +621,7 @@ class Retriever:
                 supplement_info = self._build_supplement_info(res_ids, entities, res_ids, list(res_ids.keys()), 25, chunk_counts_history)
                 result.update(supplement_info)
                 result["retrieval_type"] = f"EntityAware Filter, Loop for {len(chunk_counts_history)-1} times"
-            return result        
+            return result
 
     def _build_supplement_info(self, chunk_ids, entities, neighbor_nodes, keys, len_chunks, chunk_counts_history):
         return {
