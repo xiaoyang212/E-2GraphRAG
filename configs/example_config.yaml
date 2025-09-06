@@ -36,3 +36,4 @@ retriever:
     overlap: 100                      # overlap of each chunk.
     tokenizer: path/to/your/tokenizer # path to your tokenizer.
     max_chunk_setting: 25             # max number of chunks to retrieve.
+    use_hybrid: True                  # enable hybrid retrieval strategy (tree + graph fusion)
