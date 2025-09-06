@@ -425,6 +425,11 @@ class Retriever:
         return filtered_res
 
     def query(self, query, **kwargs):
+        # Check if enhanced query is requested (new feature)
+        if kwargs.get("use_enhanced", True):
+            return self.enhanced_query(query, **kwargs)
+        
+        # Original query implementation for backward compatibility
         # step 1: extract the Entities from the query.
         # reuse the naive_extract_graph function, which is used in the graph building process.
         entities = self.nlp.naive_extract_graph(query.split("\n")[0])
@@ -509,6 +514,194 @@ class Retriever:
                 result.update(supplement_info)
                 result["retrieval_type"] = f"EntityAware Filter, Loop for {len(chunk_counts_history)-1} times"
             return result        
+
+    def semantic_tree_search(self, query, k=25):
+        """
+        Perform semantic search in summary tree to identify high-level and leaf nodes.
+        Returns both high-level nodes and leaf nodes separately.
+        """
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Embedder or FAISS index not available, returning empty results")
+            return [], []
+            
+        query_embed = self.embedder.encode(query).reshape(1, -1)
+        _, candidate_chunks_indexes = self.faiss_index.search(query_embed, k=k)
+        candidate_chunks_indexes = candidate_chunks_indexes[0]
+        candidate_chunk_ids = [self.collapse_tree_ids[i] for i in candidate_chunks_indexes]
+        
+        # Separate high-level nodes and leaf nodes
+        high_level_nodes = []
+        leaf_nodes = []
+        
+        for chunk_id in candidate_chunk_ids:
+            if chunk_id.startswith("leaf_"):
+                leaf_nodes.append(chunk_id)
+            elif chunk_id.startswith("summary_"):
+                high_level_nodes.append(chunk_id)
+        
+        return high_level_nodes, leaf_nodes
+
+    def find_descendants(self, node_id, visited=None):
+        """
+        Recursively find all leaf node descendants of a given node.
+        """
+        if visited is None:
+            visited = set()
+        
+        if node_id in visited:
+            return []
+        
+        visited.add(node_id)
+        descendants = []
+        
+        # If it's already a leaf node, return itself
+        if node_id.startswith("leaf_"):
+            return [node_id]
+        
+        # Get children of this node
+        children = self.cache_tree.get(node_id, {}).get("children", [])
+        
+        for child in children:
+            if child.startswith("leaf_"):
+                descendants.append(child)
+            else:
+                # Recursively get descendants of non-leaf children
+                descendants.extend(self.find_descendants(child, visited))
+        
+        return descendants
+
+    def filter_by_high_level_branches(self, candidate_chunks, high_level_nodes):
+        """
+        Filter candidate chunks to only keep those that belong to branches under high-level nodes.
+        """
+        if not high_level_nodes:
+            return candidate_chunks
+        
+        # Get all valid leaf nodes from high-level node branches
+        valid_leaf_nodes = set()
+        for high_level_node in high_level_nodes:
+            descendants = self.find_descendants(high_level_node)
+            valid_leaf_nodes.update(descendants)
+        
+        # Filter candidate chunks - only keep those that are valid leaf nodes
+        filtered_chunks = {}
+        for key, chunk_list in candidate_chunks.items():
+            filtered_list = [chunk for chunk in chunk_list if chunk in valid_leaf_nodes]
+            if filtered_list:  # Only add if there are remaining chunks
+                filtered_chunks[key] = filtered_list
+        
+        return filtered_chunks
+
+    def enhanced_query(self, query, **kwargs):
+        """
+        Enhanced query method implementing the new retrieval strategy:
+        1. Semantic search in summary tree for high-level and leaf nodes
+        2. Entity graph retrieval with shortest path constraints  
+        3. Merge and deduplicate candidate chunks
+        4. Filter using high-level nodes as filters
+        5. Apply ranking for supplementary chunks
+        """
+        # Step 1: Extract entities from query
+        entities = self.nlp.naive_extract_graph(query.split("\n")[0])
+        entities = entities["nouns"]
+        
+        # Set up parameters
+        shortest_path_k = kwargs.get("shortest_path_k", 4)
+        max_chunks = kwargs.get("max_chunk_setting", 25)
+        
+        # Step 2: Semantic search in summary tree
+        high_level_nodes, semantic_leaf_nodes = self.semantic_tree_search(query, k=max_chunks*2)
+        
+        # Convert semantic leaf nodes to the same format as local retrieval
+        semantic_chunks = {"semantic": semantic_leaf_nodes} if semantic_leaf_nodes else {}
+        
+        # Step 3: Entity graph retrieval (if entities exist)
+        entity_chunks = {}
+        if entities:
+            entity_chunks = self.local_retrieval(entities, shortest_path_k)
+        
+        # Step 4: Merge and deduplicate candidate chunks
+        all_candidate_chunks = {}
+        
+        # Add semantic chunks
+        for key, chunks in semantic_chunks.items():
+            all_candidate_chunks.setdefault(key, []).extend(chunks)
+        
+        # Add entity chunks  
+        for key, chunks in entity_chunks.items():
+            all_candidate_chunks.setdefault(key, []).extend(chunks)
+        
+        # Deduplicate within each key
+        for key in all_candidate_chunks:
+            all_candidate_chunks[key] = list(set(all_candidate_chunks[key]))
+        
+        # Step 5: Filter using high-level nodes as filters
+        filtered_chunks = self.filter_by_high_level_branches(all_candidate_chunks, high_level_nodes)
+        
+        # Step 6: Check if we have enough chunks, if not apply ranking
+        chunk_count = self._count_chunks(filtered_chunks)
+        
+        if chunk_count == 0:
+            # Fallback: try pure entity-based approach first
+            if entities and entity_chunks:
+                logger.debug("No chunks after filtering, falling back to entity-only retrieval")
+                filtered_chunks = entity_chunks
+                chunk_count = self._count_chunks(filtered_chunks)
+            
+            # If still no chunks, use semantic-only approach
+            if chunk_count == 0 and semantic_leaf_nodes:
+                logger.debug("No entity chunks, falling back to semantic-only retrieval")
+                filtered_chunks = {"semantic": semantic_leaf_nodes[:max_chunks]}
+                chunk_count = len(semantic_leaf_nodes[:max_chunks])
+            
+            # Last resort: use original query method
+            if chunk_count == 0:
+                logger.debug("Enhanced query found no chunks, falling back to original method")
+                return self.query(query, use_enhanced=False, **kwargs)
+                
+        elif chunk_count < max_chunks // 2:
+            # If we have few chunks, try to supplement with entity-aware filtering
+            if entities and all_candidate_chunks:
+                supplemented_chunks = self.entityaware_filter(all_candidate_chunks, entities)
+                supplemented_count = self._count_chunks(supplemented_chunks)
+                if supplemented_count > chunk_count:
+                    filtered_chunks = supplemented_chunks
+                    chunk_count = supplemented_count
+        elif chunk_count > max_chunks:
+            # Apply entity-aware filtering to rank and limit chunks
+            if entities:
+                filtered_chunks = self.entityaware_filter(filtered_chunks, entities)
+                chunk_count = self._count_chunks(filtered_chunks)
+            else:
+                # Simply limit chunks if no entities to rank by
+                limited_chunks = {}
+                remaining_count = max_chunks
+                for key, chunks in filtered_chunks.items():
+                    if remaining_count <= 0:
+                        break
+                    take_count = min(len(chunks), remaining_count)
+                    limited_chunks[key] = chunks[:take_count]
+                    remaining_count -= take_count
+                filtered_chunks = limited_chunks
+                chunk_count = self._count_chunks(filtered_chunks)
+        
+        # Format result
+        res_str = self.format_res(filtered_chunks)
+        result = {"chunks": res_str}
+        
+        if kwargs.get("debug", True):
+            supplement_info = self._build_supplement_info(
+                filtered_chunks, entities, filtered_chunks, 
+                list(filtered_chunks.keys()), 
+                chunk_count,
+                [(shortest_path_k, chunk_count)]
+            )
+            supplement_info["high_level_nodes"] = high_level_nodes
+            supplement_info["semantic_leaf_nodes"] = semantic_leaf_nodes
+            result.update(supplement_info)
+            result["retrieval_type"] = "Enhanced Semantic + Entity Retrieval"
+        
+        return result
 
     def _build_supplement_info(self, chunk_ids, entities, neighbor_nodes, keys, len_chunks, chunk_counts_history):
         return {
