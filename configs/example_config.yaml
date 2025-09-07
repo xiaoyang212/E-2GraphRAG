@@ -36,3 +36,5 @@ retriever:
     overlap: 100                      # overlap of each chunk.
     tokenizer: path/to/your/tokenizer # path to your tokenizer.
     max_chunk_setting: 25             # max number of chunks to retrieve.
+    use_fusion: False                 # whether to use fusion retrieval (combines entity graph + summary tree)
+    use_cross_encoder_rerank: True    # whether to use cross-encoder re-ranking in fusion mode

@@ -326,6 +326,269 @@ class Retriever:
             count += len(chunk_ids)
         return count
 
+    def _entity_scoring(self, query_entities: List[str], candidate_chunks: Dict[str, List[str]]) -> Dict[str, float]:
+        """Calculate entity-based scores for chunks based on entity frequency, co-occurrence, and importance"""
+        entity_scores = {}
+        
+        for key, chunk_ids in candidate_chunks.items():
+            for chunk_id in chunk_ids:
+                # Calculate entity score based on frequency and co-occurrence
+                entity_score = 0.0
+                key_entities = key.split("_") if key else []
+                
+                # Get appearance count for this chunk
+                chunk_appearance = self.appearance_count.get(chunk_id, {})
+                
+                # Calculate frequency-based score
+                for entity in query_entities:
+                    entity_freq = chunk_appearance.get(entity, 0)
+                    entity_score += entity_freq
+                    
+                # Add bonus for co-occurrence (entities appearing together)
+                if len(query_entities) > 1:
+                    co_occurrence_bonus = len([e for e in query_entities if e in key_entities]) / len(query_entities)
+                    entity_score *= (1 + co_occurrence_bonus)
+                    
+                entity_scores[chunk_id] = entity_score
+                
+        return entity_scores
+
+    def _summary_scoring(self, query: str, k: int = 50) -> Dict[str, float]:
+        """Calculate semantic similarity scores for chunks using dense retrieval"""
+        if self.embedder is None or self.faiss_index is None:
+            return {}
+            
+        # Get dense retrieval results with scores
+        query_embed = self.embedder.encode(query).reshape(1, -1)
+        scores, chunk_indices = self.faiss_index.search(query_embed, k=k)
+        
+        # Convert to chunk_id -> score mapping
+        summary_scores = {}
+        for i, chunk_idx in enumerate(chunk_indices[0]):
+            if chunk_idx >= 0:  # Valid index
+                chunk_id = self.collapse_tree_ids[chunk_idx]
+                summary_scores[chunk_id] = float(scores[0][i])
+                
+        return summary_scores
+
+    def _normalize_scores(self, scores: Dict[str, float]) -> Dict[str, float]:
+        """Normalize scores to [0,1] range using min-max normalization"""
+        if not scores:
+            return scores
+            
+        score_values = list(scores.values())
+        min_score = min(score_values)
+        max_score = max(score_values)
+        
+        # Avoid division by zero
+        if max_score == min_score:
+            return {chunk_id: 0.5 for chunk_id in scores.keys()}
+            
+        normalized_scores = {}
+        for chunk_id, score in scores.items():
+            normalized_scores[chunk_id] = (score - min_score) / (max_score - min_score)
+            
+        return normalized_scores
+
+    def _calculate_dynamic_weights(self, query: str, entities: List[str]) -> Tuple[float, float]:
+        """Calculate dynamic fusion weights based on query characteristics"""
+        if not query.strip():
+            return 0.5, 0.5
+            
+        # Calculate entity ratio
+        query_tokens = query.split()
+        entity_ratio = len(entities) / len(query_tokens) if query_tokens else 0
+        
+        # Dynamic weight adjustment
+        if entity_ratio > 0.5:
+            # High entity density - emphasize entity matching
+            alpha = 0.7  # entity weight
+            beta = 0.3   # summary weight
+        elif entity_ratio < 0.2:
+            # Low entity density - emphasize semantic matching  
+            alpha = 0.3  # entity weight
+            beta = 0.7   # summary weight
+        else:
+            # Balanced approach
+            alpha = 0.5
+            beta = 0.5
+            
+        return alpha, beta
+
+    def _fuse_scores(self, entity_scores: Dict[str, float], summary_scores: Dict[str, float], 
+                     alpha: float, beta: float, threshold: float = 0.2) -> Dict[str, float]:
+        """Fuse normalized entity and summary scores with given weights"""
+        # Get all unique chunk IDs
+        all_chunk_ids = set(entity_scores.keys()) | set(summary_scores.keys())
+        
+        fused_scores = {}
+        for chunk_id in all_chunk_ids:
+            entity_score = entity_scores.get(chunk_id, 0.0)
+            summary_score = summary_scores.get(chunk_id, 0.0)
+            
+            # Calculate fused score
+            fused_score = alpha * entity_score + beta * summary_score
+            
+            # Apply threshold filter
+            if fused_score >= threshold:
+                fused_scores[chunk_id] = fused_score
+                
+        return fused_scores
+
+    def _cross_encoder_rerank(self, query: str, chunk_ids: List[str], top_n: int = 20) -> List[str]:
+        """
+        Re-rank chunks using a cross-encoder for more precise relevance scoring.
+        This is optional but strongly recommended for better results.
+        """
+        try:
+            # For now, use a simple heuristic re-ranking based on chunk content similarity
+            # In a production system, you would use a proper cross-encoder model
+            if not chunk_ids or len(chunk_ids) <= top_n:
+                return chunk_ids
+                
+            # Get chunk texts
+            chunk_texts = {}
+            for chunk_id in chunk_ids:
+                if chunk_id in self.cache_tree:
+                    chunk_texts[chunk_id] = self.cache_tree[chunk_id]["text"]
+            
+            # Simple text-based re-ranking (placeholder for cross-encoder)
+            query_words = set(query.lower().split())
+            
+            def calculate_overlap_score(text: str) -> float:
+                text_words = set(text.lower().split())
+                overlap = len(query_words.intersection(text_words))
+                return overlap / max(len(query_words), 1)
+            
+            # Re-rank based on text overlap
+            chunk_scores = []
+            for chunk_id in chunk_ids:
+                if chunk_id in chunk_texts:
+                    score = calculate_overlap_score(chunk_texts[chunk_id])
+                    chunk_scores.append((chunk_id, score))
+            
+            # Sort by score and return top N
+            chunk_scores.sort(key=lambda x: x[1], reverse=True)
+            return [chunk_id for chunk_id, score in chunk_scores[:top_n]]
+            
+        except Exception as e:
+            logger.warning(f"Cross-encoder re-ranking failed: {e}, returning original order")
+            return chunk_ids[:top_n]
+
+    def fusion_retrieval(self, query: str, entities: List[str], **kwargs) -> Dict[str, List[str]]:
+        """
+        Fusion retrieval that combines entity graph and summary tree retrieval
+        following the pipeline described in the problem statement
+        """
+        max_chunks = kwargs.get("max_chunk_setting", 25)
+        k_candidates = max_chunks * 2  # Retrieve more candidates for fusion
+        
+        # Step 1: Independent retrieval and scoring
+        logger.debug("Step 1: Independent retrieval and scoring")
+        
+        # Entity graph retrieval
+        entity_candidates = {}
+        if entities:
+            # Use local retrieval to get entity-based candidates
+            shortest_path_k = kwargs.get("shortest_path_k", 4)
+            entity_candidates = self.local_retrieval(entities, shortest_path_k)
+            
+            # If no results from local retrieval, try occurrence ranking
+            if self._count_chunks(entity_candidates) == 0:
+                # Get candidates from dense retrieval for occurrence ranking
+                dense_candidates = self.dense_retrieval(query, k_candidates)
+                candidate_chunk_ids = dense_candidates.get("", [])
+                entity_candidates = self.occurrence_ranking(candidate_chunk_ids, entities)
+        
+        # Calculate entity scores
+        entity_scores = self._entity_scoring(entities, entity_candidates)
+        
+        # Summary tree retrieval and scoring
+        summary_scores = self._summary_scoring(query, k_candidates)
+        
+        # Step 2: Score normalization
+        logger.debug("Step 2: Score normalization")
+        entity_scores_norm = self._normalize_scores(entity_scores)
+        summary_scores_norm = self._normalize_scores(summary_scores)
+        
+        # Step 3: Dynamic weight calculation and fusion
+        logger.debug("Step 3: Dynamic weight calculation and fusion")
+        alpha, beta = self._calculate_dynamic_weights(query, entities)
+        logger.debug(f"Dynamic weights: alpha={alpha}, beta={beta}")
+        
+        fused_scores = self._fuse_scores(entity_scores_norm, summary_scores_norm, alpha, beta)
+        
+        # Step 4: Re-ranking with cross-encoder (optional but recommended)
+        use_rerank = kwargs.get("use_cross_encoder_rerank", True)
+        if use_rerank:
+            logger.debug("Step 4: Cross-encoder re-ranking")
+            sorted_chunks = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            # Get more candidates for re-ranking
+            rerank_candidates = min(max_chunks * 2, len(sorted_chunks))
+            candidate_chunk_ids = [chunk_id for chunk_id, score in sorted_chunks[:rerank_candidates]]
+            
+            # Apply cross-encoder re-ranking
+            reranked_chunk_ids = self._cross_encoder_rerank(query, candidate_chunk_ids, max_chunks)
+        else:
+            logger.debug("Step 4: Skipping cross-encoder re-ranking")
+            sorted_chunks = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            reranked_chunk_ids = [chunk_id for chunk_id, score in sorted_chunks[:max_chunks]]
+        
+        # Step 5: Result merging and deduplication
+        logger.debug("Step 5: Result merging and deduplication")
+        result_chunks = reranked_chunk_ids
+        
+        # Group chunks by entities they contain for consistent format
+        result_dict = {}
+        for chunk_id in result_chunks:
+            # Find which entities this chunk contains
+            chunk_entities = []
+            for entity in entities:
+                if chunk_id in self.index.get(entity, []):
+                    chunk_entities.append(entity)
+            
+            if chunk_entities:
+                key = "_".join(sorted(chunk_entities))
+                result_dict.setdefault(key, []).append(chunk_id)
+            else:
+                # For chunks without entities (from summary retrieval)
+                result_dict.setdefault("", []).append(chunk_id)
+                
+        return self.merge_keys(result_dict)
+
+    def query_fusion(self, query: str, **kwargs) -> dict:
+        """
+        Main fusion query method that implements the complete fusion pipeline
+        """
+        # Step 1: Extract entities from query
+        entities = self.nlp.naive_extract_graph(query.split("\n")[0])
+        entities = entities["nouns"]
+        logger.debug(f"Extracted entities: {entities}")
+
+        # If no embedder available, fallback to original query method
+        if self.embedder is None or self.faiss_index is None:
+            logger.warning("Embedder or FAISS index not available, falling back to original retrieval")
+            return self.query(query, **kwargs)
+
+        # Use fusion retrieval
+        fusion_result = self.fusion_retrieval(query, entities, **kwargs)
+        res_str = self.format_res(fusion_result)
+        
+        result = {"chunks": res_str}
+        
+        if kwargs.get("debug", True):
+            supplement_info = self._build_supplement_info(
+                fusion_result, entities, fusion_result, 
+                list(fusion_result.keys()), 
+                self._count_chunks(fusion_result), 
+                []  # No chunk count history for fusion method
+            )
+            result.update(supplement_info)
+            result["retrieval_type"] = "Fusion Retrieval"
+            
+        return result
+
     def entityaware_filter(self, candidate_chunks:Dict[str, List[str]], entities:List[str]) -> Dict[str, List[str]]:
         # filter rules:
         # 1. the chunk includes more different entities, the priority is higher.
@@ -425,6 +688,10 @@ class Retriever:
         return filtered_res
 
     def query(self, query, **kwargs):
+        # Check if fusion mode is requested
+        if kwargs.get("use_fusion", False):
+            return self.query_fusion(query, **kwargs)
+            
         # step 1: extract the Entities from the query.
         # reuse the naive_extract_graph function, which is used in the graph building process.
         entities = self.nlp.naive_extract_graph(query.split("\n")[0])
