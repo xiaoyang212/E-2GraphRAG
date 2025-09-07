@@ -8,3 +8,7 @@ cache/
 ans_log/
 old_code/
 baselines/
+
+# Test files (keep in repo for reference but can be excluded if needed)
+# test_fusion.py
+# test_integration.py
