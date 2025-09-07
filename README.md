@@ -12,6 +12,24 @@
 
 E²GraphRAG is a lightweight and modular framework designed to enhance both **efficiency** and **effectiveness** in Graph-based Retrieval-Augmented Generation (RAG). It streamlines the pipeline from document parsing to answer generation via structured graph reasoning.
 
+## 🆕 New: Fusion Retrieval Strategy
+
+E²GraphRAG now supports a **fusion retrieval strategy** that combines the strengths of both entity graph retrieval and summary tree retrieval:
+
+- **Entity Graph Retrieval**: Excels at capturing specific entities and factual relationships  
+- **Summary Tree Retrieval**: Captures broader semantic context through dense embeddings
+- **Dynamic Fusion**: Automatically adjusts retrieval weights based on query characteristics
+- **Cross-Encoder Re-ranking**: Optional re-ranking for improved precision
+
+### Key Features:
+- ✅ **Score Normalization**: Min-max normalization ensures fair score combination
+- ✅ **Dynamic Weighting**: Adapts to entity-heavy vs. semantic queries automatically  
+- ✅ **Threshold Filtering**: Removes low-relevance chunks to reduce noise
+- ✅ **Cross-Encoder Re-ranking**: Optional but recommended for better results
+- ✅ **Backward Compatible**: Works alongside existing retrieval methods
+
+See [`FUSION_RETRIEVAL.md`](./FUSION_RETRIEVAL.md) for detailed documentation.
+
 ## 📁 Project Structure
 
 ```
@@ -25,8 +43,11 @@ E²GraphRAG is a lightweight and modular framework designed to enhance both **ef
 ├── GlobalConfig.py
 ├── process_utils.py
 ├── prompt_dict.py
-├── query.py
-└── utils.py
+├── query.py                    # Enhanced with fusion retrieval
+├── utils.py
+├── FUSION_RETRIEVAL.md        # Fusion strategy documentation
+├── test_fusion.py             # Fusion functionality tests
+└── test_integration.py        # Integration tests
 ```
 
 ## 📦 Datasets
@@ -70,6 +91,37 @@ Step-by-step:
 > bash
 > python main.py --config <path_to_config_file>
 > ```
+
+### 3. Using Fusion Retrieval
+
+To enable the new fusion retrieval strategy, update your config file:
+
+```yaml
+retriever:
+  kwargs:
+    use_fusion: True                    # Enable fusion retrieval
+    use_cross_encoder_rerank: True      # Enable re-ranking (optional)
+    max_chunk_setting: 25               # Maximum chunks to return
+```
+
+Or use it programmatically:
+
+```python
+from query import Retriever
+
+# Initialize retriever
+retriever = Retriever(cache_tree, G, index, appearance_count, nlp, **kwargs)
+
+# Query with fusion mode  
+result = retriever.query(
+    "What is the relationship between machine learning and artificial intelligence?",
+    use_fusion=True,
+    debug=True
+)
+
+print(f"Retrieval method: {result['retrieval_type']}")
+print(f"Retrieved content: {result['chunks']}")
+```
 
 ## 📬 Contact & Citation
 
