@@ -255,6 +255,7 @@ class DualIndexBuilder:
         return concept_vectors
     
     def build_graph_with_vectors(self, concept_vectors: Dict[str, np.ndarray],
+                                 I_c_to_s: Dict[str, List[str]],
                                  cooccurrence: Dict[Tuple[str, str], int],
                                  theta_sem: float = 0.3,
                                  theta_co: int = 1) -> nx.Graph:
@@ -262,15 +263,17 @@ class DualIndexBuilder:
         Build concept graph with edge weights using Dice coefficient
         
         Edge weight: r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
+        where |T_{w_i}| is the number of sentences containing concept w_i
         
         Args:
             concept_vectors: Concept to vector mapping
+            I_c_to_s: Mapping from concepts to sentences (I_{c→s}: w → S_w)
             cooccurrence: Co-occurrence counts between concepts
             theta_sem: Semantic similarity threshold
             theta_co: Co-occurrence threshold
             
         Returns:
-            Graph with weighted edges
+            Graph with weighted edges calculated using Dice coefficient
         """
         G = nx.Graph()
         
@@ -301,8 +304,15 @@ class DualIndexBuilder:
                 
                 if similarity >= theta_sem:
                     # Calculate Dice coefficient for edge weight
-                    # For simplicity, using co-occurrence count as weight
-                    weight = co_count
+                    # r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
+                    T_i = len(I_c_to_s.get(concept_i, []))  # Number of sentences containing concept_i
+                    T_j = len(I_c_to_s.get(concept_j, []))  # Number of sentences containing concept_j
+                    
+                    if T_i + T_j > 0:
+                        weight = (2 * co_count) / (T_i + T_j)
+                    else:
+                        weight = 0
+                    
                     G.add_edge(concept_i, concept_j, weight=weight)
         
         return G
