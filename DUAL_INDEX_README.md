@@ -46,6 +46,7 @@ During retrieval, the system performs parallel dual-path retrieval and fuses the
   ```
   r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
   ```
+  where $|T_{w_i}|$ and $|T_{w_j}|$ are the numbers of chunks containing concepts $w_i$ and $w_j$ respectively
 
 - **Inverted Index**: Build $I_{c→s}: w → S_w$ (concept to sentences mapping)
 

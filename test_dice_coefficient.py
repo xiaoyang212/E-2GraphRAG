@@ -7,7 +7,7 @@ import sys
 import numpy as np
 
 def test_dice_coefficient():
-    """Test that edge weights are calculated using Dice coefficient"""
+    """Test that edge weights are calculated using Dice coefficient with chunks"""
     print("Testing Dice coefficient edge weight calculation...")
     
     # Mock data
@@ -16,9 +16,21 @@ def test_dice_coefficient():
         "concept_b": np.array([0.9, 0.1, 0.0]),  # Similar to concept_a
     }
     
+    # Concept A appears in sentences 0, 1, 2, 3 which map to chunks 0, 0, 1, 2 (3 unique chunks)
+    # Concept B appears in sentences 0, 1, 4, 5, 6 which map to chunks 0, 0, 2, 3, 3 (3 unique chunks)
     I_c_to_s = {
-        "concept_a": ["sent_0", "sent_1", "sent_2", "sent_3"],  # Appears in 4 sentences
-        "concept_b": ["sent_0", "sent_1", "sent_4", "sent_5", "sent_6"],  # Appears in 5 sentences
+        "concept_a": ["sent_0", "sent_1", "sent_2", "sent_3"],
+        "concept_b": ["sent_0", "sent_1", "sent_4", "sent_5", "sent_6"],
+    }
+    
+    I_s_to_c = {
+        "sent_0": "leaf_0",  # Both concepts appear in chunk 0
+        "sent_1": "leaf_0",  # Both concepts appear in chunk 0
+        "sent_2": "leaf_1",  # Concept A in chunk 1
+        "sent_3": "leaf_2",  # Concept A in chunk 2
+        "sent_4": "leaf_2",  # Concept B in chunk 2
+        "sent_5": "leaf_3",  # Concept B in chunk 3
+        "sent_6": "leaf_3",  # Concept B in chunk 3
     }
     
     cooccurrence = {
@@ -37,6 +49,7 @@ def test_dice_coefficient():
     G = builder.build_graph_with_vectors(
         concept_vectors=concept_vectors,
         I_c_to_s=I_c_to_s,
+        I_s_to_c=I_s_to_c,
         cooccurrence=cooccurrence,
         theta_sem=0.3,
         theta_co=1
@@ -52,8 +65,10 @@ def test_dice_coefficient():
     
     # Calculate expected Dice coefficient
     # r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
-    # r = 2 * 2 / (4 + 5) = 4 / 9 ≈ 0.444
-    expected_weight = (2 * 2) / (4 + 5)
+    # Concept A appears in chunks: {0, 1, 2} = 3 unique chunks
+    # Concept B appears in chunks: {0, 2, 3} = 3 unique chunks
+    # r = 2 * 2 / (3 + 3) = 4 / 6 ≈ 0.667
+    expected_weight = (2 * 2) / (3 + 3)
     
     print(f"Edge weight: {edge_weight}")
     print(f"Expected Dice coefficient: {expected_weight}")
@@ -62,9 +77,9 @@ def test_dice_coefficient():
     if abs(edge_weight - expected_weight) < 0.0001:
         print("✓ PASS: Edge weight correctly calculated using Dice coefficient")
         print(f"  Co-occurrence: 2")
-        print(f"  |T_a|: 4 sentences")
-        print(f"  |T_b|: 5 sentences")
-        print(f"  Weight = 2 * 2 / (4 + 5) = {expected_weight:.4f}")
+        print(f"  |T_a|: 3 chunks (leaf_0, leaf_1, leaf_2)")
+        print(f"  |T_b|: 3 chunks (leaf_0, leaf_2, leaf_3)")
+        print(f"  Weight = 2 * 2 / (3 + 3) = {expected_weight:.4f}")
         return True
     else:
         print(f"✗ FAIL: Edge weight incorrect. Got {edge_weight}, expected {expected_weight}")

@@ -256,6 +256,7 @@ class DualIndexBuilder:
     
     def build_graph_with_vectors(self, concept_vectors: Dict[str, np.ndarray],
                                  I_c_to_s: Dict[str, List[str]],
+                                 I_s_to_c: Dict[str, str],
                                  cooccurrence: Dict[Tuple[str, str], int],
                                  theta_sem: float = 0.3,
                                  theta_co: int = 1) -> nx.Graph:
@@ -263,11 +264,12 @@ class DualIndexBuilder:
         Build concept graph with edge weights using Dice coefficient
         
         Edge weight: r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
-        where |T_{w_i}| is the number of sentences containing concept w_i
+        where |T_{w_i}| is the number of chunks containing concept w_i
         
         Args:
             concept_vectors: Concept to vector mapping
             I_c_to_s: Mapping from concepts to sentences (I_{c→s}: w → S_w)
+            I_s_to_c: Mapping from sentences to chunks (I_{s→c}: s → c(s))
             cooccurrence: Co-occurrence counts between concepts
             theta_sem: Semantic similarity threshold
             theta_co: Co-occurrence threshold
@@ -305,8 +307,19 @@ class DualIndexBuilder:
                 if similarity >= theta_sem:
                     # Calculate Dice coefficient for edge weight
                     # r(w_i, w_j) = 2 * Co(w_i, w_j) / (|T_{w_i}| + |T_{w_j}|)
-                    T_i = len(I_c_to_s.get(concept_i, []))  # Number of sentences containing concept_i
-                    T_j = len(I_c_to_s.get(concept_j, []))  # Number of sentences containing concept_j
+                    # where T_{w_i} is the set of chunks containing concept w_i
+                    
+                    # Get unique chunks containing concept_i
+                    sentences_i = I_c_to_s.get(concept_i, [])
+                    chunks_i = set(I_s_to_c.get(sent_id, None) for sent_id in sentences_i)
+                    chunks_i.discard(None)  # Remove any None values
+                    T_i = len(chunks_i)
+                    
+                    # Get unique chunks containing concept_j
+                    sentences_j = I_c_to_s.get(concept_j, [])
+                    chunks_j = set(I_s_to_c.get(sent_id, None) for sent_id in sentences_j)
+                    chunks_j.discard(None)  # Remove any None values
+                    T_j = len(chunks_j)
                     
                     if T_i + T_j > 0:
                         weight = (2 * co_count) / (T_i + T_j)
