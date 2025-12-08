@@ -80,8 +80,8 @@ class DualIndexBuilder:
         """Simple sentence splitting fallback"""
         try:
             return nltk.sent_tokenize(text)
-        except:
-            # Very basic fallback
+        except (LookupError, OSError, ImportError):
+            # Very basic fallback if NLTK data is not available
             return [s.strip() for s in text.split('.') if s.strip()]
     
     def build_concept_vectors(self, I_c_to_s: Dict[str, List[str]], 
@@ -182,14 +182,14 @@ class SpacyExtractorWithSentences(Extractor):
         if language == "en":
             try:
                 nlp = spacy.load("en_core_web_lg")
-            except:
+            except (OSError, ImportError):
                 logger.info("Downloading spacy model...")
                 spacy.cli.download("en_core_web_lg")
                 nlp = spacy.load("en_core_web_lg")
         elif language == "zh":
             try:
                 nlp = spacy.load("zh_core_web_lg")
-            except:
+            except (OSError, ImportError):
                 logger.info("Downloading spacy model...")
                 spacy.cli.download("zh_core_web_lg")
                 nlp = spacy.load("zh_core_web_lg")
