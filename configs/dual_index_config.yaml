@@ -29,6 +29,7 @@ dual_index:
   enabled: True                     # whether to enable dual-index retrieval
   build_sentence_index: True        # whether to build sentence-level indices during extraction
   embedder_model: "BAAI/bge-m3"     # sentence encoder model for concept vectors
+  concept_extraction_method: "rake" # method for concept extraction: "rake", "tfidf", or "nlp"
   theta_sem: 0.3                    # semantic similarity threshold for concept graph edges
   theta_co: 1                       # co-occurrence threshold for concept graph edges
 

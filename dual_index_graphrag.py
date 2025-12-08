@@ -10,13 +10,15 @@ This module implements a dual-index retrieval system combining:
 import os
 import json
 import logging
-from typing import List, Dict, Set, Tuple, Any
+from typing import List, Dict, Set, Tuple, Any, Literal
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from extract_graph import Extractor
 import networkx as nx
 import spacy
 import nltk
+from sklearn.feature_extraction.text import TfidfVectorizer
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -27,42 +29,178 @@ class DualIndexBuilder:
     Implements the indexing phase from the algorithm
     """
     
-    def __init__(self, embedder_model: str = "BAAI/bge-m3", device: str = "cuda:0"):
+    def __init__(self, embedder_model: str = "BAAI/bge-m3", device: str = "cuda:0",
+                 concept_extraction_method: Literal["rake", "tfidf", "nlp"] = "rake"):
         self.embedder = SentenceTransformer(embedder_model, device=device)
         self.device = device
+        self.concept_extraction_method = concept_extraction_method
     
-    def build_sentence_index(self, text_chunks: List[str], nlp: Extractor) -> Tuple[Dict, Dict]:
+    def _extract_keywords_rake(self, text: str, top_k: int = 10) -> List[str]:
+        """
+        Extract keywords using RAKE (Rapid Automatic Keyword Extraction)
+        
+        Args:
+            text: Input text
+            top_k: Number of top keywords to extract
+            
+        Returns:
+            List of extracted keywords
+        """
+        try:
+            from rake_nltk import Rake
+            r = Rake()
+            r.extract_keywords_from_text(text)
+            keywords = r.get_ranked_phrases()[:top_k]
+            return keywords
+        except ImportError:
+            logger.warning("rake_nltk not available, falling back to simple extraction")
+            return self._extract_keywords_simple(text, top_k)
+    
+    def _extract_keywords_tfidf(self, texts: List[str], top_k: int = 10) -> Dict[int, List[str]]:
+        """
+        Extract keywords using TF-IDF
+        
+        Args:
+            texts: List of input texts
+            top_k: Number of top keywords per text
+            
+        Returns:
+            Dictionary mapping text index to keywords
+        """
+        if len(texts) == 0:
+            return {}
+        
+        # Use TF-IDF with character n-grams and word n-grams
+        vectorizer = TfidfVectorizer(
+            max_features=None,
+            ngram_range=(1, 2),
+            stop_words='english',
+            lowercase=True
+        )
+        
+        try:
+            tfidf_matrix = vectorizer.fit_transform(texts)
+            feature_names = vectorizer.get_feature_names_out()
+            
+            keywords_dict = {}
+            for idx, text_idx in enumerate(range(len(texts))):
+                # Get TF-IDF scores for this text
+                tfidf_scores = tfidf_matrix[idx].toarray()[0]
+                
+                # Get top-k keywords
+                top_indices = tfidf_scores.argsort()[-top_k:][::-1]
+                keywords = [feature_names[i] for i in top_indices if tfidf_scores[i] > 0]
+                keywords_dict[text_idx] = keywords
+            
+            return keywords_dict
+        except Exception as e:
+            logger.warning(f"TF-IDF extraction failed: {e}, using simple extraction")
+            return {i: self._extract_keywords_simple(text, top_k) for i, text in enumerate(texts)}
+    
+    def _extract_keywords_simple(self, text: str, top_k: int = 10) -> List[str]:
+        """
+        Simple keyword extraction fallback using word frequency
+        
+        Args:
+            text: Input text
+            top_k: Number of top keywords
+            
+        Returns:
+            List of keywords
+        """
+        # Remove punctuation and convert to lowercase
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        
+        # Simple stopwords
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                     'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+                     'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                     'would', 'should', 'could', 'may', 'might', 'can', 'this', 'that',
+                     'these', 'those', 'it', 'its', 'they', 'their', 'them'}
+        
+        # Filter stopwords and count
+        word_freq = {}
+        for word in words:
+            if word not in stopwords:
+                word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Sort by frequency and return top-k
+        sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+        return [word for word, _ in sorted_words[:top_k]]
+    
+    def build_sentence_index(self, text_chunks: List[str], nlp: Extractor = None) -> Tuple[Dict, Dict, Dict]:
         """
         Build sentence-level indices for concept graph retrieval
+        Uses unsupervised algorithms (RAKE or TF-IDF) for concept extraction
         
         Args:
             text_chunks: List of text chunks (C = {c_1, c_2, ..., c_N})
-            nlp: Extractor instance for NLP processing
+            nlp: Optional Extractor instance for NLP processing (used if method="nlp")
             
         Returns:
             I_s_to_c: Mapping from sentences to chunks (I_{s→c}: s → c(s))
             I_c_to_s: Mapping from concepts to sentences (I_{c→s}: w → S_w)
+            sentence_texts: Mapping from sentence ID to text
         """
         I_s_to_c = {}  # sentence ID to chunk ID mapping
         I_c_to_s = {}  # concept to sentence IDs mapping
         sentence_texts = {}  # sentence ID to text mapping
         
         sentence_id = 0
+        all_sentences = []
+        sentence_to_chunk_map = {}
         
+        # First pass: collect all sentences
         for chunk_id, chunk_text in enumerate(text_chunks):
             # Extract sentences from the chunk
-            if isinstance(nlp, SpacyExtractorWithSentences):
+            if nlp and isinstance(nlp, SpacyExtractorWithSentences):
                 sentences = nlp.extract_sentences(chunk_text)
             else:
                 # Fallback to simple sentence splitting
                 sentences = self._simple_sentence_split(chunk_text)
             
             for sentence in sentences:
+                sent_id = f"sent_{sentence_id}"
                 # Map sentence to chunk
-                I_s_to_c[f"sent_{sentence_id}"] = f"leaf_{chunk_id}"
-                sentence_texts[f"sent_{sentence_id}"] = sentence
+                I_s_to_c[sent_id] = f"leaf_{chunk_id}"
+                sentence_texts[sent_id] = sentence
+                all_sentences.append(sentence)
+                sentence_to_chunk_map[len(all_sentences) - 1] = sent_id
+                sentence_id += 1
+        
+        # Second pass: extract concepts using selected method
+        if self.concept_extraction_method == "rake":
+            # Extract keywords using RAKE for each sentence
+            for sent_idx, sentence in enumerate(all_sentences):
+                sent_id = sentence_to_chunk_map[sent_idx]
+                concepts = self._extract_keywords_rake(sentence, top_k=10)
                 
-                # Extract concepts from sentence
+                # Map concepts to sentences
+                for concept in concepts:
+                    if concept not in I_c_to_s:
+                        I_c_to_s[concept] = []
+                    I_c_to_s[concept].append(sent_id)
+                    
+        elif self.concept_extraction_method == "tfidf":
+            # Extract keywords using TF-IDF for all sentences
+            keywords_dict = self._extract_keywords_tfidf(all_sentences, top_k=10)
+            
+            for sent_idx, concepts in keywords_dict.items():
+                sent_id = sentence_to_chunk_map[sent_idx]
+                
+                # Map concepts to sentences
+                for concept in concepts:
+                    if concept not in I_c_to_s:
+                        I_c_to_s[concept] = []
+                    I_c_to_s[concept].append(sent_id)
+                    
+        elif self.concept_extraction_method == "nlp":
+            # Use NLP-based extraction (original method)
+            if nlp is None:
+                raise ValueError("NLP extractor required when method='nlp'")
+            
+            for sent_idx, sentence in enumerate(all_sentences):
+                sent_id = sentence_to_chunk_map[sent_idx]
                 result = nlp.naive_extract_graph(sentence)
                 concepts = result.get("nouns", [])
                 
@@ -70,9 +208,9 @@ class DualIndexBuilder:
                 for concept in concepts:
                     if concept not in I_c_to_s:
                         I_c_to_s[concept] = []
-                    I_c_to_s[concept].append(f"sent_{sentence_id}")
-                
-                sentence_id += 1
+                    I_c_to_s[concept].append(sent_id)
+        else:
+            raise ValueError(f"Unknown concept extraction method: {self.concept_extraction_method}")
         
         return I_s_to_c, I_c_to_s, sentence_texts
     

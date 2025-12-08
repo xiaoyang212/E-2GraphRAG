@@ -310,21 +310,23 @@ def save_appearance_count(result, cache_path:str):
     with open(cache_path, "w") as f:
         json.dump(result, f, indent=4)
     
-def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extractor, 
+def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extractor = None, 
                                   use_cache=True, reextract=False, build_dual_index=True,
-                                  embedder_model="BAAI/bge-m3", device="cuda:0"):
+                                  embedder_model="BAAI/bge-m3", device="cuda:0",
+                                  concept_extraction_method="rake"):
     """
     Extract graph with optional dual-index building
     
     Args:
         text: List of text chunks
         cache_folder: Folder to cache results
-        nlp: NLP extractor
+        nlp: NLP extractor (optional, required only if concept_extraction_method="nlp")
         use_cache: Whether to use cached results
         reextract: Force re-extraction
         build_dual_index: Whether to build dual index (sentence-level indices)
         embedder_model: Model for sentence embeddings
         device: Device to run embedder
+        concept_extraction_method: Method for concept extraction ("rake", "tfidf", or "nlp")
         
     Returns:
         Tuple of (graph, index, appearance_count, dual_index_data)
@@ -333,19 +335,22 @@ def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extracto
     
     extract_start_time = time.time()
     
+    # Determine cache suffix based on method
+    method_suffix = concept_extraction_method if build_dual_index else (nlp.method if nlp else "default")
+    
     # Check if dual index cache exists
     dual_index_cache_exists = all([
-        os.path.exists(os.path.join(cache_folder, f"I_s_to_c_{nlp.method}.json")),
-        os.path.exists(os.path.join(cache_folder, f"I_c_to_s_{nlp.method}.json")),
-        os.path.exists(os.path.join(cache_folder, f"sentence_texts_{nlp.method}.json")),
-        os.path.exists(os.path.join(cache_folder, f"concept_vectors_{nlp.method}.json"))
+        os.path.exists(os.path.join(cache_folder, f"I_s_to_c_{method_suffix}.json")),
+        os.path.exists(os.path.join(cache_folder, f"I_c_to_s_{method_suffix}.json")),
+        os.path.exists(os.path.join(cache_folder, f"sentence_texts_{method_suffix}.json")),
+        os.path.exists(os.path.join(cache_folder, f"concept_vectors_{method_suffix}.json"))
     ])
     
     # Load from cache if available
-    if use_cache and os.path.exists(os.path.join(cache_folder, f"graph_{nlp.method}.json")) and dual_index_cache_exists:
+    if use_cache and os.path.exists(os.path.join(cache_folder, f"graph_{method_suffix}.json")) and dual_index_cache_exists:
         graph_data = load_cache(cache_folder)
         if build_dual_index:
-            I_s_to_c, I_c_to_s, sentence_texts, concept_vectors = load_dual_index(cache_folder, nlp.method)
+            I_s_to_c, I_c_to_s, sentence_texts, concept_vectors = load_dual_index(cache_folder, method_suffix)
             dual_index_data = {
                 "I_s_to_c": I_s_to_c,
                 "I_c_to_s": I_c_to_s, 
@@ -356,42 +361,59 @@ def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extracto
         else:
             return graph_data + (None,), -1
     
-    # Build from scratch
-    graph_file_path = os.path.join(cache_folder, f"graph_{nlp.method}.json")
-    index_file_path = os.path.join(cache_folder, f"index_{nlp.method}.json")
-    appearance_count_file_path = os.path.join(cache_folder, f"appearance_count_{nlp.method}.json")
-    edges = []
-    index = {}
-    appearance_count = {}
+    # Build from scratch - only need nlp for original graph construction
+    if nlp is None and concept_extraction_method == "nlp":
+        raise ValueError("NLP extractor required when concept_extraction_method='nlp'")
+    
+    # For backward compatibility, if nlp is provided, use it for graph construction
+    if nlp is not None:
+        graph_file_path = os.path.join(cache_folder, f"graph_{nlp.method}.json")
+        index_file_path = os.path.join(cache_folder, f"index_{nlp.method}.json")
+        appearance_count_file_path = os.path.join(cache_folder, f"appearance_count_{nlp.method}.json")
+        edges = []
+        index = {}
+        appearance_count = {}
 
-    for i, chunk in enumerate(text):
-        if i % 10 == 1:
-            logger.info(f"Now extracting the {i}th chunk...")
-        naive_result = nlp.naive_extract_graph(chunk)
-        # not merge the entities.
-        appearance_count["leaf_{}".format(i)] = naive_result["appearance_count"]
+        for i, chunk in enumerate(text):
+            if i % 10 == 1:
+                logger.info(f"Now extracting the {i}th chunk...")
+            naive_result = nlp.naive_extract_graph(chunk)
+            # not merge the entities.
+            appearance_count["leaf_{}".format(i)] = naive_result["appearance_count"]
 
-        for noun in naive_result["nouns"]:
-            if noun not in index:
-                index[noun] = []
-            index[noun].append("leaf_{}".format(i))
-        
-        for noun, count in naive_result["appearance_count"].items():
-            appearance_count[noun] = appearance_count.get(noun, 0) + count
+            for noun in naive_result["nouns"]:
+                if noun not in index:
+                    index[noun] = []
+                index[noun].append("leaf_{}".format(i))
+            
+            for noun, count in naive_result["appearance_count"].items():
+                appearance_count[noun] = appearance_count.get(noun, 0) + count
 
-        # add the cooccurrence.
-        for pair, weight in naive_result["cooccurrence"].items():
-            head, tail = pair
-            edges.append([head, tail, weight])
+            # add the cooccurrence.
+            for pair, weight in naive_result["cooccurrence"].items():
+                head, tail = pair
+                edges.append([head, tail, weight])
 
-    # build the graph.
-    G = build_graph(edges)
+        # build the graph.
+        G = build_graph(edges)
+    else:
+        # No graph construction if nlp not provided
+        G = nx.Graph()
+        index = {}
+        appearance_count = {}
+        graph_file_path = os.path.join(cache_folder, f"graph_{method_suffix}.json")
+        index_file_path = os.path.join(cache_folder, f"index_{method_suffix}.json")
+        appearance_count_file_path = os.path.join(cache_folder, f"appearance_count_{method_suffix}.json")
     
     # Build dual index if requested
     dual_index_data = None
     if build_dual_index:
-        logger.info("Building dual index (sentence-level indices)...")
-        dual_builder = DualIndexBuilder(embedder_model=embedder_model, device=device)
+        logger.info(f"Building dual index (sentence-level indices) using {concept_extraction_method}...")
+        dual_builder = DualIndexBuilder(
+            embedder_model=embedder_model, 
+            device=device,
+            concept_extraction_method=concept_extraction_method
+        )
         
         # Build sentence indices
         I_s_to_c, I_c_to_s, sentence_texts = dual_builder.build_sentence_index(text, nlp)
@@ -402,7 +424,7 @@ def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extracto
         logger.info(f"Built concept vectors for {len(concept_vectors)} concepts")
         
         # Save dual index
-        save_dual_index(cache_folder, I_s_to_c, I_c_to_s, sentence_texts, concept_vectors, nlp.method)
+        save_dual_index(cache_folder, I_s_to_c, I_c_to_s, sentence_texts, concept_vectors, method_suffix)
         
         dual_index_data = {
             "I_s_to_c": I_s_to_c,
@@ -411,10 +433,12 @@ def extract_graph_with_dual_index(text:List[str], cache_folder:str, nlp:Extracto
             "concept_vectors": concept_vectors
         }
     
-    # save the graph and index.
-    save_graph(edges, graph_file_path)
-    save_index(index, index_file_path)
-    save_appearance_count(appearance_count, appearance_count_file_path)
+    # save the graph and index if nlp was provided
+    if nlp is not None:
+        save_graph(edges, graph_file_path)
+        save_index(index, index_file_path)
+        save_appearance_count(appearance_count, appearance_count_file_path)
+    
     extract_end_time = time.time()
     return (G, index, appearance_count, dual_index_data), extract_end_time - extract_start_time
 

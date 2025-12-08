@@ -27,7 +27,11 @@ During retrieval, the system performs parallel dual-path retrieval and fuses the
 - Build hierarchical tree $T$ containing original chunks and multi-level summaries
 
 #### 1.3 Concept Graph Construction
-- **Concept Extraction**: Extract keywords from each chunk using NLP (Spacy/NLTK)
+- **Concept Extraction**: Extract keywords from each chunk using **unsupervised algorithms** (RAKE or TF-IDF)
+  - **RAKE** (Rapid Automatic Keyword Extraction): Extracts multi-word keyphrases based on word co-occurrence
+  - **TF-IDF**: Identifies important terms based on term frequency-inverse document frequency
+  - **NLP** (optional): Uses Spacy/NLTK for entity and noun extraction
+  
 - **Node Vectorization**: For each concept $w$, compute vector by averaging sentence embeddings:
   ```
   Vector(w) = (1/|S_w|) * Σ_{s ∈ S_w} φ(s)
@@ -89,15 +93,24 @@ from dual_index_graphrag import DualIndexBuilder, DualIndexRetriever
 from extract_graph import extract_graph_with_dual_index, load_nlp
 from query import Retriever
 
-# 1. Extract graph with dual index
-nlp = load_nlp(language="en", method="Spacy")
+# 1. Extract graph with dual index using RAKE for concept extraction
 (G, index, appearance_count, dual_index_data), time_cost = extract_graph_with_dual_index(
     text=text_chunks,
     cache_folder="./cache",
-    nlp=nlp,
+    nlp=None,  # Not required when using RAKE or TF-IDF
     build_dual_index=True,
     embedder_model="BAAI/bge-m3",
-    device="cuda:0"
+    device="cuda:0",
+    concept_extraction_method="rake"  # Options: "rake", "tfidf", or "nlp"
+)
+
+# Alternative: Use TF-IDF for concept extraction
+(G, index, appearance_count, dual_index_data), time_cost = extract_graph_with_dual_index(
+    text=text_chunks,
+    cache_folder="./cache",
+    nlp=None,
+    build_dual_index=True,
+    concept_extraction_method="tfidf"
 )
 
 # 2. Initialize retriever with dual index
@@ -133,6 +146,7 @@ dual_index:
   enabled: True
   build_sentence_index: True
   embedder_model: "BAAI/bge-m3"
+  concept_extraction_method: "rake"  # Options: "rake", "tfidf", or "nlp"
   theta_sem: 0.3  # Semantic similarity threshold
   theta_co: 1     # Co-occurrence threshold
 
