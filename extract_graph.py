@@ -44,17 +44,17 @@ class SpacyExtractor(Extractor):
         if language == "en":
             try:
                 nlp = spacy.load("en_core_web_lg")
-            except:
+            except (OSError, ImportError):
                 logger.info("Downloading spacy model...")
                 spacy.cli.download("en_core_web_lg")
                 nlp = spacy.load("en_core_web_lg")
         elif language == "zh":
             try:
-                nlp = spacy.load("en_core_web_lg")
-            except:
+                nlp = spacy.load("zh_core_web_lg")
+            except (OSError, ImportError):
                 logger.info("Downloading spacy model...")
-                spacy.cli.download("en_core_web_lg")
-                nlp = spacy.load("en_core_web_lg")
+                spacy.cli.download("zh_core_web_lg")
+                nlp = spacy.load("zh_core_web_lg")
         return nlp
     
     def naive_extract_graph(self, text: str):
