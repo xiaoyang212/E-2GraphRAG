@@ -47,6 +47,12 @@ class Retriever:
             logger.warning("Warning: the embedder is set to None, dense retrieval is not implemented.")
             self.embedder = None
             self.faiss_index = None
+        
+        # Dual-index support (optional)
+        self.dual_index_data = kwargs.get("dual_index_data", None)
+        self.dual_retriever = None
+        if self.dual_index_data is not None:
+            self._init_dual_retriever()
 
     def __del__(self):
         """Ensure proper cleanup of resources
@@ -61,7 +67,7 @@ class Retriever:
         except Exception as e:
             logger.error(f"Error during Retriever cleanup: {e}")
 
-    def update(self, cache_tree, G, index, appearance_count):
+    def update(self, cache_tree, G, index, appearance_count, dual_index_data=None):
         # update the retriever, from a document to another document.
         self.cache_tree = cache_tree
         self.collapse_tree, self.collapse_tree_ids = self._collapse_tree(self.cache_tree)
@@ -72,6 +78,32 @@ class Retriever:
         self.docs = self.collapse_tree
         if self.embedder is not None:
             self.faiss_index = self._build_faiss_index()
+        
+        # Update dual-index if provided
+        self.dual_index_data = dual_index_data
+        if self.dual_index_data is not None:
+            self._init_dual_retriever()
+    
+    def _init_dual_retriever(self):
+        """Initialize dual-index retriever if dual index data is available"""
+        try:
+            from dual_index_graphrag import DualIndexRetriever
+            
+            self.dual_retriever = DualIndexRetriever(
+                cache_tree=self.cache_tree,
+                G=self.G,
+                index=self.index,
+                I_s_to_c=self.dual_index_data["I_s_to_c"],
+                I_c_to_s=self.dual_index_data["I_c_to_s"],
+                sentence_texts=self.dual_index_data["sentence_texts"],
+                concept_vectors=self.dual_index_data["concept_vectors"],
+                embedder_model="BAAI/bge-m3",
+                device=self.device
+            )
+            logger.info("Dual-index retriever initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize dual-index retriever: {e}")
+            self.dual_retriever = None
 
     def get_inverse_index(self):
         # get the inverse index, i.e., chunk_id to noun index.
@@ -519,3 +551,58 @@ class Retriever:
             "len_chunks": len_chunks,
             "chunk_counts_history": chunk_counts_history
         }
+    
+    def query_dual_path(self, query, **kwargs):
+        """
+        Dual-path retrieval combining concept graph and summary tree
+        
+        This implements the algorithm from the problem statement:
+        - Path A: Fine-grained retrieval via concept graph (sentence-level)
+        - Path B: Global retrieval via summary tree (flattened nodes)
+        - Fusion: Union of both paths
+        
+        Args:
+            query: User query string
+            **kwargs: Additional parameters
+                - K_s: Number of top sentences for Path A (default: 10)
+                - K_t: Number of top tree nodes for Path B (default: 10)
+                - concept_threshold: Similarity threshold for concept matching (default: 0.3)
+                - use_dual_path: Whether to use dual-path retrieval (default: True)
+                
+        Returns:
+            Dictionary with chunks and metadata
+        """
+        if self.dual_retriever is None:
+            logger.warning("Dual-index retriever not available, falling back to standard query")
+            return self.query(query, **kwargs)
+        
+        # Get parameters
+        K_s = kwargs.get("K_s", 10)
+        K_t = kwargs.get("K_t", 10)
+        concept_threshold = kwargs.get("concept_threshold", 0.3)
+        
+        logger.info(f"Dual-path retrieval: K_s={K_s}, K_t={K_t}, threshold={concept_threshold}")
+        
+        # Perform dual-path retrieval
+        C_pool, metadata = self.dual_retriever.dual_path_retrieval(
+            query, K_s=K_s, K_t=K_t, concept_threshold=concept_threshold
+        )
+        
+        # Get text for chunks
+        chunks_text = self.dual_retriever.get_chunks_text(C_pool)
+        
+        result = {
+            "chunks": chunks_text,
+            "retrieval_type": "Dual-Path (Concept Graph + Summary Tree)",
+            "metadata": metadata
+        }
+        
+        if kwargs.get("debug", True):
+            result.update({
+                "len_chunks": len(C_pool),
+                "path_a_chunks": metadata["path_a_chunks"],
+                "path_b_chunks": metadata["path_b_chunks"],
+                "total_chunks": metadata["total_chunks"]
+            })
+        
+        return result

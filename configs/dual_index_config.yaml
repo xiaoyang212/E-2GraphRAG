@@ -1,0 +1,54 @@
+dataset:
+  dataset_name: InfiniteChoice                                  # or InfiniteQALoader, NovelQA.
+  dataset_path: ./data/InfiniteBench/longbook_choice_eng.jsonl  # path to your dataset path. 
+  # or NovelQA: ./data/NovelQA
+  # or InfiniteQALoader: ./data/InfiniteBench/longbook_qa_eng.jsonl
+
+llm:
+  llm_name: Qwen2.5-7B-Instruct
+  llm_path: path/to/your/llm/model  # path to your llm model.
+  llm_device: cuda                  # device to run the llm.
+
+paths:
+  log_path: ./log             # path to save the log.
+  answer_path: ./answer/test  # path to save the answer. no need to identify the dataset, they will be automatically saved in corresponding folder.
+  cache_path: ./cache/test    # path to save the cache.
+
+extractor:
+  language: "en"  # language of the extractor.
+  method: "Spacy" # method of the extractor.
+
+cluster:
+  length: 1200  # length of each chunk.
+  overlap: 100  # overlap of each chunk.
+  merge_num: 5  # number of chunks to merge.
+  force_Reextract: False   # whether to force reextract the graph, ignoring the existed cache.
+  
+# Dual-Index GraphRAG Configuration
+dual_index:
+  enabled: True                     # whether to enable dual-index retrieval
+  build_sentence_index: True        # whether to build sentence-level indices during extraction
+  embedder_model: "BAAI/bge-m3"     # sentence encoder model for concept vectors
+  concept_extraction_method: "rake" # method for concept extraction: "rake", "tfidf", or "nlp"
+  theta_sem: 0.3                    # semantic similarity threshold for concept graph edges
+  theta_co: 1                       # co-occurrence threshold for concept graph edges
+
+resume:
+  resumeIndex: 0  # index of the resume.
+
+retriever:
+  mode: "dual_path"  # "standard" or "dual_path" - use dual-path retrieval or standard retrieval
+  kwargs:
+    device: cuda                      # device to run the retriever.
+    shortest_path_k: 4                # number of shortest path to retrieve (for standard mode).
+    debug: True                       # whether to print the debug information.
+    merge_num: 5                      # number of chunks to merge.
+    overlap: 100                      # overlap of each chunk.
+    tokenizer: path/to/your/tokenizer # path to your tokenizer.
+    max_chunk_setting: 25             # max number of chunks to retrieve (for standard mode).
+    embedder: "BAAI/bge-m3"           # embedder model.
+    
+    # Dual-path specific parameters
+    K_s: 10                           # number of top sentences for Path A (concept graph)
+    K_t: 10                           # number of top tree nodes for Path B (summary tree)
+    concept_threshold: 0.3            # similarity threshold for concept matching in Path A
