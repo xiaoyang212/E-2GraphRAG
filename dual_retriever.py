@@ -176,7 +176,13 @@ class DualPathRetriever:
         
         # A3: Sentence Re-ranking
         candidate_sent_ids = list(candidate_sentences)
-        candidate_sent_indices = [int(sid.split('_')[1]) for sid in candidate_sent_ids]
+        candidate_sent_indices = []
+        for sid in candidate_sent_ids:
+            try:
+                idx = int(sid.split('_')[1])
+                candidate_sent_indices.append(idx)
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Invalid sentence ID format: {sid}, skipping")
         
         # Get embeddings for candidate sentences
         candidate_embeddings = self.sentence_embeddings[candidate_sent_indices]

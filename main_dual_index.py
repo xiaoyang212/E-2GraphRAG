@@ -183,8 +183,10 @@ def main():
                             concept_threshold=configs["retriever"]["kwargs"].get("concept_threshold", 0.6)
                         )
                     else:
-                        retriever.update(tree, G, concept_to_sentences, sentence_to_chunk, 
-                                       concept_vectors, sentences)
+                        retriever.update(
+                            tree, G, concept_to_sentences, sentence_to_chunk,
+                            concept_vectors, sentences
+                        )
                     
                     res = []
                     os.makedirs(configs["paths"]["answer_path"], exist_ok=True)

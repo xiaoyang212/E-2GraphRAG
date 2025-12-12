@@ -57,7 +57,7 @@ class DualIndexBuilder:
         if language == "en":
             try:
                 self.nlp = spacy.load("en_core_web_lg")
-            except:
+            except (OSError, IOError):
                 logger.info("Downloading spacy model...")
                 spacy.cli.download("en_core_web_lg")
                 self.nlp = spacy.load("en_core_web_lg")
@@ -202,14 +202,18 @@ class DualIndexBuilder:
                                                    device=self.device)
         
         # Build concept vectors by averaging sentence embeddings
+        # Create sentence to index mapping for O(1) lookup
+        sentence_to_idx = {sent: idx for idx, sent in enumerate(sentences)}
+        
         concept_vectors = {}
         for concept, concept_sentences in concept_to_sentences.items():
             if concept_sentences:
                 # Find indices of these sentences
                 sent_indices = []
                 for sent_text in concept_sentences:
-                    if sent_text in sentences:
-                        sent_indices.append(sentences.index(sent_text))
+                    sent_idx = sentence_to_idx.get(sent_text)
+                    if sent_idx is not None:
+                        sent_indices.append(sent_idx)
                 
                 if sent_indices:
                     # Average the embeddings
