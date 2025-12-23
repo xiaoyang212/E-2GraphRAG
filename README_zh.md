@@ -2,21 +2,36 @@
 
 E²GraphRAG 是一个轻量级、模块化的框架，旨在提升基于图的增强式检索生成（Retrieval-Augmented Generation, RAG）在 **效率** 和 **效果** 两方面的表现。该框架通过结构化图推理，简化了从文档解析到答案生成的整个流程。
 
+## 🆕 双索引 GraphRAG
+
+本仓库现已包含增强版的**双索引 GraphRAG** 实现，结合了：
+- **概念图（细粒度）**：基于 TF-IDF 的细粒度概念提取，支持句子级索引
+- **摘要树（宏观全局）**：层次化摘要提供全局上下文
+- **双路径检索**：从两个索引并行检索并自适应融合
+
+👉 详细文档请参阅 [DUAL_INDEX_README.md](./DUAL_INDEX_README.md)
+
 ## 📁 项目结构
 
 ```
 .
 ├── README.md
 ├── requirements.txt
-├── main.py
+├── main.py                      # 原始 E²GraphRAG 流程
+├── main_dual_index.py          # 🆕 双索引 GraphRAG 流程
 ├── build_tree.py
 ├── dataloader.py
 ├── extract_graph.py
-├── GlobalConfig.py
+├── dual_index_builder.py       # 🆕 双索引构建
+├── dual_retriever.py           # 🆕 双路径检索
 ├── process_utils.py
 ├── prompt_dict.py
 ├── query.py
-└── utils.py
+├── utils.py
+├── DUAL_INDEX_README.md        # 🆕 双索引文档
+└── configs/
+    ├── example_config.yaml
+    └── dual_index_config.yaml  # 🆕 双索引配置
 ```
 
 
@@ -46,19 +61,29 @@ pip install -r requirements.txt
 
 ### 2. 运行主流程
 
-整个流程包括构建文档树、提取图结构并生成答案，主程序入口为 `main.py`。
+#### 方案 A：原始 E²GraphRAG
 
-运行步骤如下：
+整个流程包括构建文档树、提取图结构并生成答案：
 
-> Step 1：准备配置文件
-> 使用 YAML 格式的配置文件来定义关键参数。
+```bash
+python main.py --config configs/example_config.yaml
+```
 
-> 👉 示例路径：./configs/example_config.yaml
+#### 方案 B：双索引 GraphRAG 🆕
 
-Step 2：运行主程序
-> ```
->  python main.py --config <配置文件路径>
-> ```
+增强版的双索引流程，支持概念图和双路径检索：
+
+```bash
+python main_dual_index.py --config configs/dual_index_config.yaml
+```
+
+**主要区别：**
+- 使用 TF-IDF 进行概念提取（相对于 NER）
+- 句子级索引实现细粒度检索
+- 双路径检索（概念图 + 摘要树）
+- 自适应融合检索结果
+
+详细文档请参阅 [DUAL_INDEX_README.md](./DUAL_INDEX_README.md)
 
 ### 📬 联系我们 & 引用
 

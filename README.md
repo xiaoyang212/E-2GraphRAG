@@ -12,21 +12,36 @@
 
 E²GraphRAG is a lightweight and modular framework designed to enhance both **efficiency** and **effectiveness** in Graph-based Retrieval-Augmented Generation (RAG). It streamlines the pipeline from document parsing to answer generation via structured graph reasoning.
 
+## 🆕 Dual-Index GraphRAG
+
+This repository now includes an enhanced **Dual-Index GraphRAG** implementation that combines:
+- **Concept Graph (细粒度)**: TF-IDF-based fine-grained concept extraction with sentence-level indexing
+- **Summary Tree (宏观全局)**: Hierarchical summarization for global context
+- **Dual-Path Retrieval**: Parallel retrieval from both indices with adaptive fusion
+
+👉 See [DUAL_INDEX_README.md](./DUAL_INDEX_README.md) for detailed documentation.
+
 ## 📁 Project Structure
 
 ```
 .
 ├── README.md
 ├── requirements.txt
-├── main.py
+├── main.py                      # Original E²GraphRAG pipeline
+├── main_dual_index.py          # 🆕 Dual-Index GraphRAG pipeline
 ├── build_tree.py
 ├── dataloader.py
 ├── extract_graph.py
-├── GlobalConfig.py
+├── dual_index_builder.py       # 🆕 Dual-index construction
+├── dual_retriever.py           # 🆕 Dual-path retrieval
 ├── process_utils.py
 ├── prompt_dict.py
 ├── query.py
-└── utils.py
+├── utils.py
+├── DUAL_INDEX_README.md        # 🆕 Dual-index documentation
+└── configs/
+    ├── example_config.yaml
+    └── dual_index_config.yaml  # 🆕 Dual-index configuration
 ```
 
 ## 📦 Datasets
@@ -54,22 +69,29 @@ pip install -r requirements.txt
 
 ### 2. Run the Pipeline
 
+#### Option A: Original E²GraphRAG
+
 The entire pipeline—tree construction, graph extraction, and answer generation—is executed via `main.py`.
 
-Step-by-step:
+```bash
+python main.py --config configs/example_config.yaml
+```
 
-1. Create a config file
+#### Option B: Dual-Index GraphRAG 🆕
 
-> Prepare a YAML configuration file to define key parameters.
+The enhanced dual-index pipeline with concept graph and dual-path retrieval:
 
-> 👉 Example: `./configs/example_config.yaml`
+```bash
+python main_dual_index.py --config configs/dual_index_config.yaml
+```
 
-2. Run the pipeline
+**Key differences:**
+- Uses TF-IDF for concept extraction (vs NER)
+- Sentence-level indexing for fine-grained retrieval
+- Dual-path retrieval (concept graph + summary tree)
+- Adaptive fusion of retrieval results
 
-> ```
-> bash
-> python main.py --config <path_to_config_file>
-> ```
+See [DUAL_INDEX_README.md](./DUAL_INDEX_README.md) for detailed documentation.
 
 ## 📬 Contact & Citation
 

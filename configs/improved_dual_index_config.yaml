@@ -1,0 +1,51 @@
+dataset:
+  dataset_name: InfiniteChoice
+  dataset_path: ./data/InfiniteBench/longbook_choice_eng.jsonl
+
+llm:
+  llm_name: Qwen2.5-7B-Instruct
+  llm_path: path/to/your/llm/model
+  llm_device: cuda
+
+paths:
+  log_path: ./log
+  answer_path: ./answer/improved_dual_index
+  cache_path: ./cache/improved_dual_index
+
+extractor:
+  language: "en"
+  method: "Spacy"  # Used for NER extraction
+
+cluster:
+  length: 1200
+  overlap: 100
+  merge_num: 5
+  force_Reextract: False
+
+resume:
+  resumeIndex: 0
+
+retriever:
+  kwargs:
+    device: cuda
+    embedder: BAAI/bge-m3
+    debug: True
+    merge_num: 5
+    overlap: 100
+    tokenizer: path/to/your/tokenizer
+    
+    # Improved Dual-Index specific parameters
+    use_ner: True                     # Use NER entities (like original system)
+    use_tfidf: True                   # Also use TF-IDF keywords
+    concept_top_k: 30                 # Increased from 20 for better coverage
+    sentence_top_k: 40                # Increased from 30
+    tree_top_k: 25                    # Keep same for tree retrieval
+    concept_threshold: 0.5            # Lowered from 0.6 for more recall
+    max_path_length: 3                # Maximum path length in graph traversal
+    use_graph_traversal: True         # Enable graph traversal like original
+    
+    # Concept graph construction parameters
+    min_tfidf_score: 0.15             # Increased from 0.1 for better precision
+    semantic_threshold: 0.65          # Lowered from 0.7 for more edges
+    cooccurrence_threshold: 2         # Keep same
+    top_k_tfidf: 15                   # Top TF-IDF keywords per chunk
